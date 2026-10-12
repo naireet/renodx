@@ -3643,8 +3643,19 @@ inline bool OnResolveTextureRegion(
           new_format = reshade::api::format::r8g8b8a8_unorm;
           break;
         default:
-          assert(false);
-          break;
+          // The event format is a valid view of an unmodified typeless source (e.g. R10G10B10A2 MSAA).
+          if (utils::resource::FormatToTypeless(new_format) == source_desc_new.texture.format) break;
+          {
+            std::stringstream s;
+            s << "utils::resource::upgrade::OnResolveTextureRegion(";
+            s << "no typed format for resolve, keeping original: ";
+            s << PRINT_PTR(source.handle) << " => " << PRINT_PTR(dest.handle);
+            s << ", format: " << format;
+            s << ", source_format: " << source_desc_new.texture.format;
+            s << ");";
+            reshade::log::message(reshade::log::level::warning, s.str().c_str());
+          }
+          return false;
       }
     }
 
