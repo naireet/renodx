@@ -48,9 +48,9 @@ void main(
   uint4 bitmask;
   r2 = 0;  // Only read after assignment; silences fxc's conservative uninitialized-use warning.
 
-  r15.y = ((uint)cb13[0].x >> 4) & 0xF;
+  r15.y = (asuint(cb13[0].x) >> 4) & 0xF;  // Azimuth bitfield: cb1 block offset for this draw.
   r0.x = cmp(asint(cb1[r15.y + 543].y) != 0);
-  if (cb1[r15.y + 553].x != 0) {
+  if (asint(cb1[r15.y + 553].x) != 0) {
     r1.xy = (int2)v0.xy;
     r1.zw = float2(0, 0);
     r0.y = t10.Load(r1.xyw).x;
