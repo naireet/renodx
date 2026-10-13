@@ -1,0 +1,16 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "forzahorizon2",
+  "title": "Forza Horizon 2 (Azimuth)",
+  "status": "experimental",
+  "summary": "Forza Horizon 2 (Xbox One) running under the Azimuth 0.9.7 translation layer. Shader hashes are tied to Azimuth's runtime-translated shaders.",
+  "deploy": {
+    "game_exe": "azimuth.exe",
+    "process_name": "azimuth.exe",
+    "api": "d3d12",
+    "architecture": [
+      "x64"
+    ],
+    "reshade_preferred_name": "dxgi.dll"
+  }
+}
