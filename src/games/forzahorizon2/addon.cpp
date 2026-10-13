@@ -24,6 +24,7 @@
 #include "../../utils/state.hpp"
 #include "../../utils/swapchain.hpp"
 #include "./shared.h"
+#include "./streamline.hpp"
 
 namespace {
 
@@ -629,6 +630,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
       SyncSwapChainOutputPreset();
+      reshade::register_event<reshade::addon_event::create_device>(forzahorizon2::streamline::OnCreateDevice);
+      reshade::register_event<reshade::addon_event::init_device>(forzahorizon2::streamline::OnInitDevice);
+      reshade::register_event<reshade::addon_event::present>(forzahorizon2::streamline::OnPresent);
+      reshade::register_event<reshade::addon_event::finish_present>(forzahorizon2::streamline::OnFinishPresent);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
@@ -639,6 +644,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       break;
     case DLL_PROCESS_DETACH:
+      reshade::unregister_event<reshade::addon_event::create_device>(forzahorizon2::streamline::OnCreateDevice);
+      reshade::unregister_event<reshade::addon_event::init_device>(forzahorizon2::streamline::OnInitDevice);
+      reshade::unregister_event<reshade::addon_event::present>(forzahorizon2::streamline::OnPresent);
+      reshade::unregister_event<reshade::addon_event::finish_present>(forzahorizon2::streamline::OnFinishPresent);
+      forzahorizon2::streamline::Uninstall();
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
