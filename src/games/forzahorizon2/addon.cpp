@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <vector>
 
 #include <deps/imgui/imgui.h>
 #include <embed/shaders.h>
@@ -226,18 +227,48 @@ struct FrameGenerationInputs {
 };
 FrameGenerationInputs frame_generation_inputs;
 
-void DestroyFrameGenerationInputs(reshade::api::device* device) {
-  frame_generation_inputs.pass.DestroyAll(device);
-  frame_generation_inputs.pass = {};
-  for (auto* resource : {&frame_generation_inputs.motion_vectors, &frame_generation_inputs.depth}) {
-    if (resource->handle != 0u) {
-      device->destroy_resource(*resource);
-      *resource = {0u};
+// Replaced targets and their PSO may still be referenced by in-flight frames (and Streamline at present), so
+// they are destroyed only after enough presents for the GPU to have finished with them.
+struct RetiredFrameGenerationInputs {
+  reshade::api::resource motion_vectors = {0u};
+  reshade::api::resource depth = {0u};
+  renodx::utils::render::RenderPass pass;
+  uint64_t retired_at_present = 0u;
+};
+constexpr uint64_t RETIRED_INPUTS_PRESENT_DELAY = 8u;
+std::vector<RetiredFrameGenerationInputs> retired_frame_generation_inputs;
+std::atomic<uint64_t> present_count = 0u;
+
+void DestroyRetiredFrameGenerationInputs(reshade::api::device* device, bool all) {
+  const uint64_t presents = present_count.load();
+  std::erase_if(retired_frame_generation_inputs, [&](RetiredFrameGenerationInputs& retired) {
+    if (!all && retired.retired_at_present + RETIRED_INPUTS_PRESENT_DELAY > presents) return false;
+    retired.pass.DestroyAll(device);
+    for (const auto& resource : {retired.motion_vectors, retired.depth}) {
+      if (resource.handle != 0u) {
+        device->destroy_resource(resource);
+      }
     }
+    return true;
+  });
+}
+
+void RetireFrameGenerationInputs() {
+  auto& inputs = frame_generation_inputs;
+  if (inputs.motion_vectors.handle != 0u || inputs.depth.handle != 0u || inputs.pass.pipeline.handle != 0u) {
+    retired_frame_generation_inputs.push_back({
+        .motion_vectors = inputs.motion_vectors,
+        .depth = inputs.depth,
+        .pass = std::move(inputs.pass),
+        .retired_at_present = present_count.load(),
+    });
   }
-  frame_generation_inputs.width = 0u;
-  frame_generation_inputs.height = 0u;
-  frame_generation_inputs.layout = 0u;
+  inputs.pass = {};
+  inputs.motion_vectors = {0u};
+  inputs.depth = {0u};
+  inputs.width = 0u;
+  inputs.height = 0u;
+  inputs.layout = 0u;
 }
 
 void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
@@ -255,8 +286,9 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
 
   const std::unique_lock lock(frame_generation_inputs.mutex);
   auto& inputs = frame_generation_inputs;
+  DestroyRetiredFrameGenerationInputs(device, false);
   if (inputs.width != width || inputs.height != height || inputs.layout != layout.handle) {
-    DestroyFrameGenerationInputs(device);
+    RetireFrameGenerationInputs();
     constexpr auto USAGE = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
     const bool created =
         device->create_resource(
@@ -270,7 +302,7 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
         inputs.failure_logged = true;
         reshade::log::message(reshade::log::level::error, "forzahorizon2: failed to create DLSS input targets.");
       }
-      DestroyFrameGenerationInputs(device);
+      RetireFrameGenerationInputs();
       return;
     }
     inputs.width = width;
@@ -335,7 +367,8 @@ void OnInitDevice(reshade::api::device* device) {
 void OnDestroyDevice(reshade::api::device* device) {
   {
     const std::unique_lock lock(frame_generation_inputs.mutex);
-    DestroyFrameGenerationInputs(device);
+    RetireFrameGenerationInputs();
+    DestroyRetiredFrameGenerationInputs(device, true);
   }
   if (settings_buffer.handle == 0u) return;
   device->unmap_buffer_region(settings_buffer);
@@ -709,6 +742,7 @@ void OnPresent(
     const reshade::api::rect* /*dest_rect*/,
     uint32_t /*dirty_rect_count*/,
     const reshade::api::rect* /*dirty_rects*/) {
+  present_count.fetch_add(1u);
   output_pass_active = output_pass_replaced.exchange(false);
   SyncSwapChainOutputPreset();
   if (swapchain == nullptr || !next_color_space.has_value()) return;
@@ -764,6 +798,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::init_device>(forzahorizon2::streamline::OnInitDevice);
       reshade::register_event<reshade::addon_event::present>(forzahorizon2::streamline::OnPresent);
       reshade::register_event<reshade::addon_event::finish_present>(forzahorizon2::streamline::OnFinishPresent);
+      reshade::register_event<reshade::addon_event::destroy_swapchain>(forzahorizon2::streamline::OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
@@ -778,6 +813,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::init_device>(forzahorizon2::streamline::OnInitDevice);
       reshade::unregister_event<reshade::addon_event::present>(forzahorizon2::streamline::OnPresent);
       reshade::unregister_event<reshade::addon_event::finish_present>(forzahorizon2::streamline::OnFinishPresent);
+      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(forzahorizon2::streamline::OnDestroySwapchain);
       forzahorizon2::streamline::Uninstall();
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);

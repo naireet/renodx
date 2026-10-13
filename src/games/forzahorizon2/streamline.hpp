@@ -96,7 +96,7 @@ inline float frame_generation_setting = 1.f;
 inline std::atomic_bool inputs_tagged = false;
 inline bool frame_generation_on = false;
 inline uint32_t tagged_width = 0u;
-inline uint32_t tagged_height = 0u;
+inline uint32_t tagged_height = 0u; std::atomic<uint32_t> tag_log_count = 0u; std::atomic<uint32_t> present_log_count = 0u;
 inline std::atomic_bool swap_chain_created = false;
 // Streamline's proxies call back into the native objects whose vtable slots are redirected here.
 inline thread_local bool in_streamline_call = false;
@@ -375,6 +375,9 @@ inline void TagFrameInputs(
   tagged_width = width;
   tagged_height = height;
   inputs_tagged = true;
+  if (tag_log_count.fetch_add(1u) < 3u) {
+    renodx::utils::log::i("streamline: tagged inputs for frame ", static_cast<uint32_t>(*token), " on thread ", GetCurrentThreadId());
+  }
 }
 
 inline sl::float4x4 IdentityMatrix() {
@@ -431,6 +434,27 @@ inline void LogFrameGenerationState(const sl::DLSSGOptions& options) {
       ", inputs ", tagged_width, "x", tagged_height);
 }
 
+inline void SetFrameGenerationMode(bool enabled) {
+  frame_generation_on = enabled;
+  if (api.reflex_set_options != nullptr) {
+    sl::ReflexOptions reflex_options = {};
+    reflex_options.mode = (enabled ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff);
+    api.reflex_set_options(reflex_options);
+  }
+  sl::DLSSGOptions options = {};
+  options.mode = (enabled ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
+  options.numFramesToGenerate = 1u;
+  const auto result = api.dlssg_set_options(VIEWPORT, options);
+  renodx::utils::log::i("streamline: slDLSSGSetOptions(", (enabled ? "on" : "off"), "): ", static_cast<uint32_t>(result));
+  LogFrameGenerationState(options);
+}
+
+// DLSS-G must be off while the swapchain is resized or changes fullscreen state; OnPresent re-enables it.
+inline void OnDestroySwapchain(reshade::api::swapchain* /*swapchain*/, bool /*resize*/) {
+  if (!IsActive() || !frame_generation_on || api.dlssg_set_options == nullptr) return;
+  SetFrameGenerationMode(false);
+}
+
 inline void OnPresent(
     reshade::api::command_queue* /*queue*/,
     reshade::api::swapchain* /*swapchain*/,
@@ -455,21 +479,13 @@ inline void OnPresent(
       SetCommonConstants(token);
     }
     if (want_frame_generation != frame_generation_on) {
-      frame_generation_on = want_frame_generation;
-      if (api.reflex_set_options != nullptr) {
-        sl::ReflexOptions reflex_options = {};
-        reflex_options.mode = (want_frame_generation ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff);
-        api.reflex_set_options(reflex_options);
-      }
-      sl::DLSSGOptions options = {};
-      options.mode = (want_frame_generation ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
-      options.numFramesToGenerate = 1u;
-      const auto result = api.dlssg_set_options(VIEWPORT, options);
-      renodx::utils::log::i("streamline: slDLSSGSetOptions(", (want_frame_generation ? "on" : "off"), "): ", static_cast<uint32_t>(result));
-      LogFrameGenerationState(options);
+      SetFrameGenerationMode(want_frame_generation);
     }
   }
 
+  if (token != nullptr && present_log_count.fetch_add(1u) < 3u) {
+    renodx::utils::log::i("streamline: present frame ", static_cast<uint32_t>(*token), " on thread ", GetCurrentThreadId(), ", inputs tagged: ", inputs_tagged.load());
+  }
   SetMarker(sl::PCLMarker::eRenderSubmitEnd);
   SetMarker(sl::PCLMarker::ePresentStart);
 }
