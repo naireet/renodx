@@ -448,6 +448,15 @@ void RecordDlssInputs(reshade::api::command_list* cmd_list) {
   const bool dlaa = forzahorizon2::jitter::dlaa_setting != 0.f;
   const auto jitter = (forzahorizon2::jitter::IsEnabled() ? forzahorizon2::jitter::CurrentOffset() : std::array<float, 2>{0.f, 0.f});
   const auto jitter_sign = static_cast<uint32_t>(forzahorizon2::jitter::jitter_sign_setting);
+  if (static thread_local uint32_t logged_jitter_sign = UINT32_MAX; dlaa && logged_jitter_sign != jitter_sign) {
+    logged_jitter_sign = jitter_sign;
+    reshade::log::message(
+        reshade::log::level::info,
+        renodx::utils::log::BuildString(
+            "forzahorizon2: DLAA jitter sign ", jitter_sign, " (x ", ((jitter_sign & 1u) != 0u ? "flipped" : "default"),
+            ", y ", ((jitter_sign & 2u) != 0u ? "flipped" : "default"), "), current offset ", jitter[0], ", ", jitter[1], " px")
+            .c_str());
+  }
   forzahorizon2::streamline::TagFrameInputs(
       cmd_list, inputs.motion_vectors, inputs.depth, width, height,
       jitter[0] * ((jitter_sign & 1u) != 0u ? -1.f : 1.f),
