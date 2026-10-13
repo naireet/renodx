@@ -241,6 +241,9 @@ struct FrameGenerationInputs {
   uint64_t layout = 0u;
   renodx::utils::render::RenderPass motion_vector_pass;
   renodx::utils::render::RenderPass ui_pass;
+#ifdef FH2_DEV_SETTINGS
+  renodx::utils::render::RenderPass ui_debug_pass;
+#endif
   reshade::api::resource ui_pass_display_plane = {0u};
   bool hudless_scene_ready = false;
   bool failure_logged = false;
@@ -313,6 +316,10 @@ void RetireUiPass() {
   retired_frame_generation_inputs.push_back({.passes = {}, .retired_at_present = present_count.load()});
   retired_frame_generation_inputs.back().passes.push_back(std::move(inputs.ui_pass));
   inputs.ui_pass = {};
+#ifdef FH2_DEV_SETTINGS
+  retired_frame_generation_inputs.back().passes.push_back(std::move(inputs.ui_debug_pass));
+  inputs.ui_debug_pass = {};
+#endif
   inputs.ui_pass_display_plane = {0u};
 }
 
@@ -581,6 +588,28 @@ void RecordFrameGenerationUiInputs(reshade::api::command_list* cmd_list) {
     };
     pass.push_constants[renodx::utils::render::ConstantBuffersSlots{.slot = 13u, .space = 50u}] = std::span<const float>(
         reinterpret_cast<const float*>(&shader_injection), sizeof(shader_injection) / sizeof(float));
+#ifdef FH2_DEV_SETTINGS
+    auto& debug_pass = inputs.ui_debug_pass;
+    debug_pass.use_render_pass = false;
+    debug_pass.revert_state_after_render = true;
+    debug_pass.pipeline_subobjects.vertex_shader = __fullscreen_triangle;
+    debug_pass.pipeline_subobjects.pixel_shader = __ui_mask_debug;
+    reshade::api::blend_desc blend = {};
+    blend.blend_enable[0] = true;
+    blend.source_color_blend_factor[0] = reshade::api::blend_factor::source_alpha;
+    blend.dest_color_blend_factor[0] = reshade::api::blend_factor::one_minus_source_alpha;
+    blend.source_alpha_blend_factor[0] = reshade::api::blend_factor::zero;
+    blend.dest_alpha_blend_factor[0] = reshade::api::blend_factor::one;
+    debug_pass.pipeline_subobjects.blend_states = {blend};
+    debug_pass.shader_resource_slots.resources = {inputs.ui_alpha, display_plane, inputs.hudless_scene};
+    debug_pass.shader_resource_slots.view_descs = {
+        reshade::api::resource_view_desc(reshade::api::format::r16_float),
+        reshade::api::resource_view_desc(reshade::api::format_to_default_typed(display_plane_desc.texture.format, 0)),
+        reshade::api::resource_view_desc(reshade::api::format::r16g16b16a16_float),
+    };
+    debug_pass.push_constants[renodx::utils::render::ConstantBuffersSlots{.slot = 13u, .space = 50u}] = std::span<const float>(
+        reinterpret_cast<const float*>(&shader_injection), sizeof(shader_injection) / sizeof(float));
+#endif
   }
 
   const reshade::api::resource targets[2] = {inputs.hudless, inputs.ui_alpha};
@@ -594,6 +623,20 @@ void RecordFrameGenerationUiInputs(reshade::api::command_list* cmd_list) {
     return;
   }
   forzahorizon2::streamline::TagUiInputs(cmd_list, inputs.hudless, inputs.ui_alpha, inputs.width, inputs.height);
+
+#ifdef FH2_DEV_SETTINGS
+  // Tints the presented (real) frame in the backbuffer the output pass just wrote.
+  if (shader_injection.frame_generation_ui_debug != 0.f) {
+    if (const auto backbuffer_view = renodx::utils::state::GetRenderTarget(cmd_list, 0u); backbuffer_view.handle != 0u) {
+      auto& debug_pass = inputs.ui_debug_pass;
+      debug_pass.render_target_slots.views = {backbuffer_view};
+      debug_pass.auto_generate_viewport = false;
+      debug_pass.viewports = {reshade::api::viewport{
+          .x = 0.f, .y = 0.f, .width = static_cast<float>(inputs.width), .height = static_cast<float>(inputs.height), .min_depth = 0.f, .max_depth = 1.f}};
+      debug_pass.Render(cmd_list);
+    }
+  }
+#endif
 }
 void OnInitDevice(reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d12) return;
@@ -993,6 +1036,19 @@ renodx::utils::settings::Settings settings = {
                    "\nExact: translucent HUD pixels blend over the interpolated scene.",
         .labels = {"Exact", "Solid"},
         .is_enabled = []() { return forzahorizon2::streamline::IsActive() && forzahorizon2::streamline::frame_generation_setting != 0.f; },
+        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FrameGenerationUiDebug",
+        .binding = &shader_injection.frame_generation_ui_debug,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .can_reset = false,
+        .label = "Show UI Mask (debug)",
+        .section = "Frame Generation",
+        .tooltip = "Tints the presented real frame red where DLSS-G treats pixels as UI."
+                   "\nUI Alpha: the tagged mask. HUD Coverage: display plane alpha. HUD Difference: visible HUD change.",
+        .labels = {"Off", "UI Alpha", "HUD Coverage", "HUD Difference"},
         .is_visible = []() { return forzahorizon2::streamline::initialized; },
     },
 #endif

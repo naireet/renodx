@@ -33,7 +33,7 @@ struct ShaderInjectData {
   float psychov_gamut_compression;
 
   float frame_generation_ui_mask;
-  float padding0;
+  float frame_generation_ui_debug;
   float padding1;
   float padding2;
 };
@@ -70,6 +70,8 @@ cbuffer injected_buffer : register(b13, space50) {
 #define RENODX_PSYCHOV_GAMUT_COMPRESSION     shader_injection.psychov_gamut_compression
 // DLSS-G UI alpha: 0 exact HUD coverage, 1 solid (any coverage counts as UI).
 #define CUSTOM_FRAME_GENERATION_UI_MASK      shader_injection.frame_generation_ui_mask
+// Dev-only UI mask view: 0 off, 1 tagged UI alpha, 2 HUD coverage, 3 visible HUD difference.
+#define CUSTOM_FRAME_GENERATION_UI_DEBUG     shader_injection.frame_generation_ui_debug
 #define RENODX_COLOR_GRADE_STRENGTH          shader_injection.color_grade_strength
 // SDR output re-encodes sRGB like vanilla, so 2.2 emulation only applies in HDR.
 #define RENODX_GAMMA_CORRECTION              (shader_injection.swap_chain_output_preset == 0.f ? 0.f : shader_injection.gamma_correction)
