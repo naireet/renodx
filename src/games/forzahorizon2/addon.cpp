@@ -34,7 +34,8 @@
 
 namespace {
 
-ShaderInjectData shader_injection = {};
+// Solid DLSS-G HUD mask by default (user-tested); only exposed as a setting in FH2_DEV_SETTINGS builds.
+ShaderInjectData shader_injection = {.frame_generation_ui_mask = 1.f};
 
 // Tonemap target (txFinalTemp, HUD drawn on top) and the display plane copy. Azimuth places game textures over
 // title-memory heaps, so upgrade through committed clones, never in place. The typed RGBA16F target matters:
@@ -979,6 +980,7 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
         .is_visible = []() { return forzahorizon2::streamline::initialized; },
     },
+#ifdef FH2_DEV_SETTINGS
     new renodx::utils::settings::Setting{
         .key = "FrameGenerationUiMask",
         .binding = &shader_injection.frame_generation_ui_mask,
@@ -993,6 +995,7 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []() { return forzahorizon2::streamline::IsActive() && forzahorizon2::streamline::frame_generation_setting != 0.f; },
         .is_visible = []() { return forzahorizon2::streamline::initialized; },
     },
+#endif
     new renodx::utils::settings::Setting{
         .key = "Dlaa",
         .binding = &forzahorizon2::jitter::dlaa_setting,
@@ -1006,6 +1009,8 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
         .is_visible = []() { return forzahorizon2::streamline::initialized; },
     },
+// Development knobs (pacing, jitter convention and jitter-only tests); shipping uses their defaults.
+#ifdef FH2_DEV_SETTINGS
     new renodx::utils::settings::Setting{
         .key = "DlaaJitterSign",
         .binding = &forzahorizon2::jitter::jitter_sign_setting,
@@ -1042,6 +1047,7 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
         .is_visible = []() { return forzahorizon2::streamline::initialized; },
     },
+#endif
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
         .label = "Recommended",
