@@ -212,27 +212,35 @@ void OnDestroyPipelineLayout(reshade::api::device* /*device*/, reshade::api::pip
   settings_param_by_layout.erase(layout.handle);
 }
 
-// DLSS inputs (frame generation, later DLAA): full-resolution unclamped motion vectors and a depth copy, drawn
-// right after the tonemap draw on Azimuth's root signature so that draw's depth, stencil, cb1 and cb13 bindings
-// are reused as-is. Owned targets keep Streamline's state tracking independent of Azimuth's enhanced barriers.
+// DLSS inputs (frame generation, later DLAA):
+// - At the tonemap draw: full-resolution unclamped motion vectors and a depth copy, drawn on Azimuth's root
+//   signature so that draw's depth, stencil, cb1 and cb13 bindings are reused as-is; plus a copy of the
+//   HUD-less tonemap output (the HUD draws onto the same target afterwards).
+// - At the output pass: the HUD-less scene encoded like the backbuffer, and the UI alpha.
+// Owned targets keep Streamline's state tracking independent of Azimuth's enhanced barriers.
 struct FrameGenerationInputs {
   std::mutex mutex;
   reshade::api::resource motion_vectors = {0u};
   reshade::api::resource depth = {0u};
+  reshade::api::resource hudless_scene = {0u};
+  reshade::api::resource hudless = {0u};
+  reshade::api::resource ui_alpha = {0u};
   uint32_t width = 0u;
   uint32_t height = 0u;
   uint64_t layout = 0u;
-  renodx::utils::render::RenderPass pass;
+  renodx::utils::render::RenderPass motion_vector_pass;
+  renodx::utils::render::RenderPass ui_pass;
+  reshade::api::resource ui_pass_display_plane = {0u};
+  bool hudless_scene_ready = false;
   bool failure_logged = false;
 };
 FrameGenerationInputs frame_generation_inputs;
 
-// Replaced targets and their PSO may still be referenced by in-flight frames (and Streamline at present), so
+// Replaced targets and their PSOs may still be referenced by in-flight frames (and Streamline at present), so
 // they are destroyed only after enough presents for the GPU to have finished with them.
 struct RetiredFrameGenerationInputs {
-  reshade::api::resource motion_vectors = {0u};
-  reshade::api::resource depth = {0u};
-  renodx::utils::render::RenderPass pass;
+  std::vector<reshade::api::resource> resources;
+  std::vector<renodx::utils::render::RenderPass> passes;
   uint64_t retired_at_present = 0u;
 };
 constexpr uint64_t RETIRED_INPUTS_PRESENT_DELAY = 8u;
@@ -243,32 +251,52 @@ void DestroyRetiredFrameGenerationInputs(reshade::api::device* device, bool all)
   const uint64_t presents = present_count.load();
   std::erase_if(retired_frame_generation_inputs, [&](RetiredFrameGenerationInputs& retired) {
     if (!all && retired.retired_at_present + RETIRED_INPUTS_PRESENT_DELAY > presents) return false;
-    retired.pass.DestroyAll(device);
-    for (const auto& resource : {retired.motion_vectors, retired.depth}) {
-      if (resource.handle != 0u) {
-        device->destroy_resource(resource);
-      }
+    for (auto& pass : retired.passes) {
+      pass.DestroyAll(device);
+    }
+    for (const auto& resource : retired.resources) {
+      device->destroy_resource(resource);
     }
     return true;
   });
 }
 
+void RetireUiPass() {
+  auto& inputs = frame_generation_inputs;
+  retired_frame_generation_inputs.push_back({.passes = {}, .retired_at_present = present_count.load()});
+  retired_frame_generation_inputs.back().passes.push_back(std::move(inputs.ui_pass));
+  inputs.ui_pass = {};
+  inputs.ui_pass_display_plane = {0u};
+}
+
 void RetireFrameGenerationInputs() {
   auto& inputs = frame_generation_inputs;
-  if (inputs.motion_vectors.handle != 0u || inputs.depth.handle != 0u || inputs.pass.pipeline.handle != 0u) {
-    retired_frame_generation_inputs.push_back({
-        .motion_vectors = inputs.motion_vectors,
-        .depth = inputs.depth,
-        .pass = std::move(inputs.pass),
-        .retired_at_present = present_count.load(),
-    });
+  RetireUiPass();
+  auto& retired = retired_frame_generation_inputs.back();
+  retired.passes.push_back(std::move(inputs.motion_vector_pass));
+  for (auto* resource : {&inputs.motion_vectors, &inputs.depth, &inputs.hudless_scene, &inputs.hudless, &inputs.ui_alpha}) {
+    if (resource->handle != 0u) {
+      retired.resources.push_back(*resource);
+    }
+    *resource = {0u};
   }
-  inputs.pass = {};
-  inputs.motion_vectors = {0u};
-  inputs.depth = {0u};
+  inputs.motion_vector_pass = {};
+  inputs.hudless_scene_ready = false;
   inputs.width = 0u;
   inputs.height = 0u;
   inputs.layout = 0u;
+}
+
+void LogFrameGenerationFailure(const char* message) {
+  if (frame_generation_inputs.failure_logged) return;
+  frame_generation_inputs.failure_logged = true;
+  reshade::log::message(reshade::log::level::error, message);
+}
+
+// Clone-upgraded targets are accessed through their RGBA16F clone; the game's view handles name the original.
+reshade::api::resource ResolveUpgradedResource(reshade::api::resource resource) {
+  const auto clone = renodx::utils::resource::upgrade::GetResourceClone(resource, {.allow_create = false});
+  return (clone.handle != 0u ? clone : resource);
 }
 
 void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
@@ -280,7 +308,8 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
   if (layout.handle == 0u || target_view.handle == 0u) return;
 
   auto* device = cmd_list->get_device();
-  const auto target_desc = device->get_resource_desc(device->get_resource_from_view(target_view));
+  const auto target = ResolveUpgradedResource(device->get_resource_from_view(target_view));
+  const auto target_desc = device->get_resource_desc(target);
   const uint32_t width = target_desc.texture.width;
   const uint32_t height = target_desc.texture.height;
 
@@ -289,32 +318,34 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
   DestroyRetiredFrameGenerationInputs(device, false);
   if (inputs.width != width || inputs.height != height || inputs.layout != layout.handle) {
     RetireFrameGenerationInputs();
-    constexpr auto USAGE = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
-    const bool created =
-        device->create_resource(
-            reshade::api::resource_desc(width, height, 1u, 1u, reshade::api::format::r16g16_float, 1u, reshade::api::memory_heap::gpu_only, USAGE),
-            nullptr, reshade::api::resource_usage::shader_resource, &inputs.motion_vectors)
-        && device->create_resource(
-            reshade::api::resource_desc(width, height, 1u, 1u, reshade::api::format::r32_float, 1u, reshade::api::memory_heap::gpu_only, USAGE),
-            nullptr, reshade::api::resource_usage::shader_resource, &inputs.depth);
+    const auto create_target = [&](reshade::api::format format, reshade::api::resource_usage usage, reshade::api::resource* resource) {
+      return device->create_resource(
+          reshade::api::resource_desc(width, height, 1u, 1u, format, 1u, reshade::api::memory_heap::gpu_only, usage),
+          nullptr, reshade::api::resource_usage::shader_resource, resource);
+    };
+    constexpr auto RENDER_TARGET_USAGE = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
+    constexpr auto COPY_TARGET_USAGE = reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::shader_resource;
+    const bool created = create_target(reshade::api::format::r16g16_float, RENDER_TARGET_USAGE, &inputs.motion_vectors)
+                         && create_target(reshade::api::format::r32_float, RENDER_TARGET_USAGE, &inputs.depth)
+                         && create_target(reshade::api::format::r16g16b16a16_float, COPY_TARGET_USAGE, &inputs.hudless_scene)
+                         && create_target(reshade::api::format::r10g10b10a2_unorm, RENDER_TARGET_USAGE, &inputs.hudless)
+                         && create_target(reshade::api::format::r16_float, RENDER_TARGET_USAGE, &inputs.ui_alpha);
     if (!created) {
-      if (!inputs.failure_logged) {
-        inputs.failure_logged = true;
-        reshade::log::message(reshade::log::level::error, "forzahorizon2: failed to create DLSS input targets.");
-      }
+      LogFrameGenerationFailure("forzahorizon2: failed to create DLSS input targets.");
       RetireFrameGenerationInputs();
       return;
     }
     inputs.width = width;
     inputs.height = height;
     inputs.layout = layout.handle;
-    inputs.pass.layout = layout;
-    inputs.pass.use_render_pass = false;
-    inputs.pass.revert_state_after_render = true;
-    inputs.pass.pipeline_subobjects.vertex_shader = __fullscreen_triangle;
-    inputs.pass.pipeline_subobjects.pixel_shader = __motion_vectors;
-    inputs.pass.render_target_slots.resources = {inputs.motion_vectors, inputs.depth};
-    inputs.pass.render_target_slots.view_descs = {
+    auto& pass = inputs.motion_vector_pass;
+    pass.layout = layout;
+    pass.use_render_pass = false;
+    pass.revert_state_after_render = true;
+    pass.pipeline_subobjects.vertex_shader = __fullscreen_triangle;
+    pass.pipeline_subobjects.pixel_shader = __motion_vectors;
+    pass.render_target_slots.resources = {inputs.motion_vectors, inputs.depth};
+    pass.render_target_slots.view_descs = {
         reshade::api::resource_view_desc(reshade::api::format::r16g16_float),
         reshade::api::resource_view_desc(reshade::api::format::r32_float),
     };
@@ -325,18 +356,80 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
   const reshade::api::resource_usage readable[2] = {reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource};
   const reshade::api::resource_usage writable[2] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::render_target};
   cmd_list->barrier(2u, targets, readable, writable);
-  const bool rendered = inputs.pass.Render(cmd_list);
+  const bool rendered = inputs.motion_vector_pass.Render(cmd_list);
   cmd_list->barrier(2u, targets, writable, readable);
   if (!rendered) {
-    if (!inputs.failure_logged) {
-      inputs.failure_logged = true;
-      reshade::log::message(reshade::log::level::error, "forzahorizon2: DLSS input pass failed.");
-    }
+    LogFrameGenerationFailure("forzahorizon2: DLSS motion vector pass failed.");
     return;
   }
   forzahorizon2::streamline::TagFrameInputs(cmd_list, inputs.motion_vectors, inputs.depth, width, height);
+
+  inputs.hudless_scene_ready = false;
+  if (target_desc.texture.format != reshade::api::format::r16g16b16a16_float) {
+    LogFrameGenerationFailure("forzahorizon2: tonemap target is not upgraded; DLSS-G UI separation disabled.");
+    return;
+  }
+  const reshade::api::resource copy_resources[2] = {target, inputs.hudless_scene};
+  const reshade::api::resource_usage copy_before[2] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource};
+  const reshade::api::resource_usage copy_during[2] = {reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest};
+  cmd_list->barrier(2u, copy_resources, copy_before, copy_during);
+  cmd_list->copy_resource(target, inputs.hudless_scene);
+  cmd_list->barrier(2u, copy_resources, copy_during, copy_before);
+  inputs.hudless_scene_ready = true;
 }
 
+void RecordFrameGenerationUiInputs(reshade::api::command_list* cmd_list) {
+  if (!forzahorizon2::streamline::IsActive()) return;
+  auto* device = cmd_list->get_device();
+  const auto display_plane_view = renodx::utils::state::GetBoundResourceView(
+      cmd_list, reshade::api::shader_stage::pixel, reshade::api::descriptor_type::shader_resource_view, 0u);
+  if (display_plane_view.handle == 0u) return;
+  const auto display_plane = ResolveUpgradedResource(device->get_resource_from_view(display_plane_view));
+
+  const std::unique_lock lock(frame_generation_inputs.mutex);
+  auto& inputs = frame_generation_inputs;
+  if (!inputs.hudless_scene_ready) return;
+  inputs.hudless_scene_ready = false;
+  const auto display_plane_desc = device->get_resource_desc(display_plane);
+  if (display_plane_desc.texture.width != inputs.width || display_plane_desc.texture.height != inputs.height) {
+    LogFrameGenerationFailure("forzahorizon2: display plane size differs from the tonemap target; DLSS-G UI separation disabled.");
+    return;
+  }
+
+  if (inputs.ui_pass_display_plane.handle != display_plane.handle) {
+    RetireUiPass();
+    inputs.ui_pass_display_plane = display_plane;
+    auto& pass = inputs.ui_pass;
+    pass.use_render_pass = false;
+    pass.revert_state_after_render = true;
+    pass.pipeline_subobjects.vertex_shader = __fullscreen_triangle;
+    pass.pipeline_subobjects.pixel_shader = __hud_split;
+    pass.shader_resource_slots.resources = {inputs.hudless_scene, display_plane};
+    pass.shader_resource_slots.view_descs = {
+        reshade::api::resource_view_desc(reshade::api::format::r16g16b16a16_float),
+        reshade::api::resource_view_desc(reshade::api::format_to_default_typed(display_plane_desc.texture.format, 0)),
+    };
+    pass.render_target_slots.resources = {inputs.hudless, inputs.ui_alpha};
+    pass.render_target_slots.view_descs = {
+        reshade::api::resource_view_desc(reshade::api::format::r10g10b10a2_unorm),
+        reshade::api::resource_view_desc(reshade::api::format::r16_float),
+    };
+    pass.push_constants[renodx::utils::render::ConstantBuffersSlots{.slot = 13u, .space = 50u}] = std::span<const float>(
+        reinterpret_cast<const float*>(&shader_injection), sizeof(shader_injection) / sizeof(float));
+  }
+
+  const reshade::api::resource targets[2] = {inputs.hudless, inputs.ui_alpha};
+  const reshade::api::resource_usage readable[2] = {reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource};
+  const reshade::api::resource_usage writable[2] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::render_target};
+  cmd_list->barrier(2u, targets, readable, writable);
+  const bool rendered = inputs.ui_pass.Render(cmd_list);
+  cmd_list->barrier(2u, targets, writable, readable);
+  if (!rendered) {
+    LogFrameGenerationFailure("forzahorizon2: DLSS-G UI separation pass failed.");
+    return;
+  }
+  forzahorizon2::streamline::TagUiInputs(cmd_list, inputs.hudless, inputs.ui_alpha, inputs.width, inputs.height);
+}
 void OnInitDevice(reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d12) return;
   if (!upgrade_infos_applied) {
@@ -389,6 +482,7 @@ void OnOutputPassDrawn(reshade::api::command_list* cmd_list) {
   renodx::utils::shader::WithReplacementPipeline(pipeline, [](auto replacement, auto /*stages*/) {
     if (replacement.handle != 0u) output_pass_replaced = true;
   });
+  RecordFrameGenerationUiInputs(cmd_list);
 }
 
 // Hashes are Azimuth 0.9.7 runtime translations; re-hash after Azimuth updates.

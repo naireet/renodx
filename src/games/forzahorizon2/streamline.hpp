@@ -103,6 +103,7 @@ inline float reflex_frame_limit_setting = 0.f;
 inline constexpr uint32_t REFLEX_FRAME_LIMIT_60_US = 16666u;
 inline constexpr uint32_t MAX_GENERATED_FRAMES = 3u;
 inline std::atomic_bool inputs_tagged = false;
+inline std::atomic_bool ui_tagged = false;
 inline bool frame_generation_on = false;
 inline uint32_t tagged_width = 0u;
 inline uint32_t tagged_height = 0u;
@@ -359,6 +360,7 @@ inline void BeginFrame() {
   }
   frame_token = token;
   inputs_tagged = false;
+  ui_tagged = false;
   if (api.reflex_sleep != nullptr) {
     api.reflex_sleep(*token);
   }
@@ -401,6 +403,34 @@ inline void TagFrameInputs(
   if (tag_log_count.fetch_add(1u) < 3u) {
     renodx::utils::log::i("streamline: tagged inputs for frame ", static_cast<uint32_t>(*token), " on thread ", GetCurrentThreadId());
   }
+}
+
+// Called while recording Azimuth's output pass; the UI alpha is the HUD coverage of the presented frame.
+inline void TagUiInputs(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource hudless,
+    reshade::api::resource ui_alpha,
+    uint32_t width,
+    uint32_t height) {
+  auto* token = frame_token.load();
+  if (!IsActive() || token == nullptr) return;
+  constexpr uint32_t SHADER_RESOURCE_STATE = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  sl::Resource hudless_resource = {sl::ResourceType::eTex2d, reinterpret_cast<void*>(hudless.handle), SHADER_RESOURCE_STATE};
+  sl::Resource ui_alpha_resource = {sl::ResourceType::eTex2d, reinterpret_cast<void*>(ui_alpha.handle), SHADER_RESOURCE_STATE};
+  const sl::Extent extent = {.top = 0u, .left = 0u, .width = width, .height = height};
+  const sl::ResourceTag tags[] = {
+      {&hudless_resource, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent},
+      {&ui_alpha_resource, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent},
+  };
+  const auto result = api.set_tag_for_frame(
+      *token, VIEWPORT, tags, static_cast<uint32_t>(std::size(tags)), reinterpret_cast<sl::CommandBuffer*>(cmd_list->get_native()));
+  if (result != sl::Result::eOk) {
+    if (tag_error_log_count.fetch_add(1u) < 3u) {
+      renodx::utils::log::e("streamline: slSetTagForFrame(UI) failed (", static_cast<uint32_t>(result), ").");
+    }
+    return;
+  }
+  ui_tagged = true;
 }
 
 inline sl::float4x4 IdentityMatrix() {
@@ -463,11 +493,12 @@ struct OutputMode {
   uint32_t generated_frames = 1u;
   sl::ReflexMode reflex = sl::ReflexMode::eOff;
   uint32_t frame_limit_us = 0u;
+  bool ui_recomposition = false;
 };
 
 inline bool operator==(const OutputMode& lhs, const OutputMode& rhs) {
   return lhs.frame_generation == rhs.frame_generation && lhs.generated_frames == rhs.generated_frames && lhs.reflex == rhs.reflex
-         && lhs.frame_limit_us == rhs.frame_limit_us;
+         && lhs.frame_limit_us == rhs.frame_limit_us && lhs.ui_recomposition == rhs.ui_recomposition;
 }
 
 inline OutputMode applied_mode = {};
@@ -487,9 +518,10 @@ inline void ApplyOutputMode(const OutputMode& mode) {
   sl::DLSSGOptions options = {};
   options.mode = (mode.frame_generation ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
   options.numFramesToGenerate = mode.generated_frames;
+  options.enableUserInterfaceRecomposition = (mode.ui_recomposition ? sl::Boolean::eTrue : sl::Boolean::eFalse);
   const auto result = api.dlssg_set_options(VIEWPORT, options);
   renodx::utils::log::i("streamline: slDLSSGSetOptions(", (mode.frame_generation ? "on" : "off"), ", generated ",
-                        mode.generated_frames, "): ", static_cast<uint32_t>(result));
+                        mode.generated_frames, ", UI recomposition ", mode.ui_recomposition, "): ", static_cast<uint32_t>(result));
   LogFrameGenerationState(options);
 }
 
@@ -525,7 +557,9 @@ inline void OnPresent(
         .generated_frames = std::clamp(static_cast<uint32_t>(frame_generation_multiplier_setting) + 1u, 1u, MAX_GENERATED_FRAMES),
         .reflex = static_cast<sl::ReflexMode>(std::clamp(static_cast<int>(reflex_setting), 0, 2)),
         .frame_limit_us = (reflex_frame_limit_setting != 0.f ? REFLEX_FRAME_LIMIT_60_US : 0u),
+        .ui_recomposition = ui_tagged.load(),
     };
+    mode.ui_recomposition = mode.ui_recomposition && mode.frame_generation;
     // DLSS-G requires Reflex; "Off" only applies while frame generation is off.
     if (mode.frame_generation && mode.reflex == sl::ReflexMode::eOff) {
       mode.reflex = sl::ReflexMode::eLowLatency;
