@@ -214,10 +214,11 @@ void OnDestroyPipelineLayout(reshade::api::device* /*device*/, reshade::api::pip
 
 // DLSS inputs (frame generation, later DLAA):
 // - At the tonemap draw: full-resolution unclamped motion vectors and a depth copy, drawn on Azimuth's root
-//   signature so that draw's depth, stencil, cb1 and cb13 bindings are reused as-is; plus a copy of the
-//   HUD-less tonemap output (the HUD draws onto the same target afterwards).
-// - At the output pass: the HUD-less scene encoded like the backbuffer, and the UI alpha.
-// Owned targets keep Streamline's state tracking independent of Azimuth's enhanced barriers.
+//   signature so that draw's depth, stencil, cb1 and cb13 bindings are reused as-is; plus the HUD-less tonemap
+//   output, by re-issuing the tonemap draw into an owned target (the HUD draws onto Azimuth's target afterwards).
+// - At the output pass: the HUD-less scene encoded like the backbuffer, and the UI alpha from the display plane.
+// Azimuth's own resources are only read where its bindings already make them readable; all writes and state
+// transitions are on owned targets, independent of Azimuth's enhanced barriers.
 struct FrameGenerationInputs {
   std::mutex mutex;
   reshade::api::resource motion_vectors = {0u};
@@ -225,6 +226,9 @@ struct FrameGenerationInputs {
   reshade::api::resource hudless_scene = {0u};
   reshade::api::resource hudless = {0u};
   reshade::api::resource ui_alpha = {0u};
+  reshade::api::resource_view hudless_scene_rtv = {0u};
+  // Display plane (A copied, HUD included), captured as the render target of Azimuth's A -> P copy draw.
+  reshade::api::resource display_plane = {0u};
   uint32_t width = 0u;
   uint32_t height = 0u;
   uint64_t layout = 0u;
@@ -236,10 +240,32 @@ struct FrameGenerationInputs {
 };
 FrameGenerationInputs frame_generation_inputs;
 
+// Recorded before mods::shader replays a matched draw, so its on_drawn callbacks (same thread) can re-issue it.
+struct LastDraw {
+  reshade::api::command_list* cmd_list = nullptr;
+  uint32_t vertex_count = 0u;
+  uint32_t instance_count = 0u;
+  uint32_t first_vertex = 0u;
+  uint32_t first_instance = 0u;
+};
+thread_local LastDraw last_draw = {};
+
+bool OnDraw(reshade::api::command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance) {
+  last_draw = {
+      .cmd_list = cmd_list,
+      .vertex_count = vertex_count,
+      .instance_count = instance_count,
+      .first_vertex = first_vertex,
+      .first_instance = first_instance,
+  };
+  return false;
+}
+
 // Replaced targets and their PSOs may still be referenced by in-flight frames (and Streamline at present), so
 // they are destroyed only after enough presents for the GPU to have finished with them.
 struct RetiredFrameGenerationInputs {
   std::vector<reshade::api::resource> resources;
+  std::vector<reshade::api::resource_view> views;
   std::vector<renodx::utils::render::RenderPass> passes;
   uint64_t retired_at_present = 0u;
 };
@@ -253,6 +279,9 @@ void DestroyRetiredFrameGenerationInputs(reshade::api::device* device, bool all)
     if (!all && retired.retired_at_present + RETIRED_INPUTS_PRESENT_DELAY > presents) return false;
     for (auto& pass : retired.passes) {
       pass.DestroyAll(device);
+    }
+    for (const auto& view : retired.views) {
+      device->destroy_resource_view(view);
     }
     for (const auto& resource : retired.resources) {
       device->destroy_resource(resource);
@@ -274,6 +303,10 @@ void RetireFrameGenerationInputs() {
   RetireUiPass();
   auto& retired = retired_frame_generation_inputs.back();
   retired.passes.push_back(std::move(inputs.motion_vector_pass));
+  if (inputs.hudless_scene_rtv.handle != 0u) {
+    retired.views.push_back(inputs.hudless_scene_rtv);
+  }
+  inputs.hudless_scene_rtv = {0u};
   for (auto* resource : {&inputs.motion_vectors, &inputs.depth, &inputs.hudless_scene, &inputs.hudless, &inputs.ui_alpha}) {
     if (resource->handle != 0u) {
       retired.resources.push_back(*resource);
@@ -308,8 +341,7 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
   if (layout.handle == 0u || target_view.handle == 0u) return;
 
   auto* device = cmd_list->get_device();
-  const auto target = ResolveUpgradedResource(device->get_resource_from_view(target_view));
-  const auto target_desc = device->get_resource_desc(target);
+  const auto target_desc = device->get_resource_desc(ResolveUpgradedResource(device->get_resource_from_view(target_view)));
   const uint32_t width = target_desc.texture.width;
   const uint32_t height = target_desc.texture.height;
 
@@ -324,12 +356,14 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
           nullptr, reshade::api::resource_usage::shader_resource, resource);
     };
     constexpr auto RENDER_TARGET_USAGE = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
-    constexpr auto COPY_TARGET_USAGE = reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::shader_resource;
     const bool created = create_target(reshade::api::format::r16g16_float, RENDER_TARGET_USAGE, &inputs.motion_vectors)
                          && create_target(reshade::api::format::r32_float, RENDER_TARGET_USAGE, &inputs.depth)
-                         && create_target(reshade::api::format::r16g16b16a16_float, COPY_TARGET_USAGE, &inputs.hudless_scene)
+                         && create_target(reshade::api::format::r16g16b16a16_float, RENDER_TARGET_USAGE, &inputs.hudless_scene)
                          && create_target(reshade::api::format::r10g10b10a2_unorm, RENDER_TARGET_USAGE, &inputs.hudless)
-                         && create_target(reshade::api::format::r16_float, RENDER_TARGET_USAGE, &inputs.ui_alpha);
+                         && create_target(reshade::api::format::r16_float, RENDER_TARGET_USAGE, &inputs.ui_alpha)
+                         && device->create_resource_view(
+                             inputs.hudless_scene, reshade::api::resource_usage::render_target,
+                             reshade::api::resource_view_desc(reshade::api::format::r16g16b16a16_float), &inputs.hudless_scene_rtv);
     if (!created) {
       LogFrameGenerationFailure("forzahorizon2: failed to create DLSS input targets.");
       RetireFrameGenerationInputs();
@@ -352,6 +386,20 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
     reshade::log::message(reshade::log::level::info, "forzahorizon2: created DLSS input targets.");
   }
 
+  // HUD-less scene: the replaced tonemap PSO and every binding are still set, so re-issue that draw into the owned
+  // RGBA16F target (same format as the upgraded tonemap target), then restore Azimuth's render targets.
+  inputs.hudless_scene_ready = false;
+  if (last_draw.cmd_list == cmd_list && target_desc.texture.format == reshade::api::format::r16g16b16a16_float) {
+    if (auto snapshot = renodx::utils::state::GetSnapshot(cmd_list); snapshot.has_value()) {
+      cmd_list->barrier(inputs.hudless_scene, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+      cmd_list->bind_render_targets_and_depth_stencil(1u, &inputs.hudless_scene_rtv);
+      cmd_list->draw(last_draw.vertex_count, last_draw.instance_count, last_draw.first_vertex, last_draw.first_instance);
+      cmd_list->barrier(inputs.hudless_scene, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+      snapshot->ApplyGraphics(false);
+      inputs.hudless_scene_ready = true;
+    }
+  }
+
   const reshade::api::resource targets[2] = {inputs.motion_vectors, inputs.depth};
   const reshade::api::resource_usage readable[2] = {reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource};
   const reshade::api::resource_usage writable[2] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::render_target};
@@ -363,33 +411,26 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
     return;
   }
   forzahorizon2::streamline::TagFrameInputs(cmd_list, inputs.motion_vectors, inputs.depth, width, height);
+}
 
-  inputs.hudless_scene_ready = false;
-  if (target_desc.texture.format != reshade::api::format::r16g16b16a16_float) {
-    LogFrameGenerationFailure("forzahorizon2: tonemap target is not upgraded; DLSS-G UI separation disabled.");
-    return;
-  }
-  const reshade::api::resource copy_resources[2] = {target, inputs.hudless_scene};
-  const reshade::api::resource_usage copy_before[2] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource};
-  const reshade::api::resource_usage copy_during[2] = {reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest};
-  cmd_list->barrier(2u, copy_resources, copy_before, copy_during);
-  cmd_list->copy_resource(target, inputs.hudless_scene);
-  cmd_list->barrier(2u, copy_resources, copy_during, copy_before);
-  inputs.hudless_scene_ready = true;
+void CaptureDisplayPlane(reshade::api::command_list* cmd_list) {
+  if (!forzahorizon2::streamline::IsActive()) return;
+  const auto view = renodx::utils::state::GetRenderTarget(cmd_list, 0u);
+  if (view.handle == 0u) return;
+  const auto display_plane = ResolveUpgradedResource(cmd_list->get_device()->get_resource_from_view(view));
+  const std::unique_lock lock(frame_generation_inputs.mutex);
+  frame_generation_inputs.display_plane = display_plane;
 }
 
 void RecordFrameGenerationUiInputs(reshade::api::command_list* cmd_list) {
   if (!forzahorizon2::streamline::IsActive()) return;
   auto* device = cmd_list->get_device();
-  const auto display_plane_view = renodx::utils::state::GetBoundResourceView(
-      cmd_list, reshade::api::shader_stage::pixel, reshade::api::descriptor_type::shader_resource_view, 0u);
-  if (display_plane_view.handle == 0u) return;
-  const auto display_plane = ResolveUpgradedResource(device->get_resource_from_view(display_plane_view));
 
   const std::unique_lock lock(frame_generation_inputs.mutex);
   auto& inputs = frame_generation_inputs;
-  if (!inputs.hudless_scene_ready) return;
+  if (!inputs.hudless_scene_ready || inputs.display_plane.handle == 0u) return;
   inputs.hudless_scene_ready = false;
+  const auto display_plane = inputs.display_plane;
   const auto display_plane_desc = device->get_resource_desc(display_plane);
   if (display_plane_desc.texture.width != inputs.width || display_plane_desc.texture.height != inputs.height) {
     LogFrameGenerationFailure("forzahorizon2: display plane size differs from the tonemap target; DLSS-G UI separation disabled.");
@@ -487,6 +528,19 @@ void OnOutputPassDrawn(reshade::api::command_list* cmd_list) {
 
 // Hashes are Azimuth 0.9.7 runtime translations; re-hash after Azimuth updates.
 renodx::mods::shader::CustomShaders custom_shaders = {
+    // FH2 copy of the tonemap target (HUD included) to the display plane; full and limited range variants.
+    {0xD2A7D2FC,
+     {
+         .crc32 = 0xD2A7D2FC,
+         .on_inject = [](reshade::api::command_list*) { return false; },
+         .on_drawn = &CaptureDisplayPlane,
+     }},
+    {0xD9FE4C7D,
+     {
+         .crc32 = 0xD9FE4C7D,
+         .on_inject = [](reshade::api::command_list*) { return false; },
+         .on_drawn = &CaptureDisplayPlane,
+     }},
     // FH2 tonemap/composite (bloom, rays, flare, Hable, LUT, vignette)
     {0x362A82D8,
      {
@@ -917,6 +971,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         initialized = true;
       }
 
+      // Before mods::shader, so draws are recorded before it replays them for on_drawn callbacks.
+      reshade::register_event<reshade::addon_event::draw>(OnDraw);
       // Module events first so their per-device data exists when this addon's init_device runs.
       renodx::utils::resource::upgrade::Use(fdw_reason);
       renodx::utils::swapchain::Use(fdw_reason);
@@ -946,6 +1002,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(forzahorizon2::streamline::OnDestroySwapchain);
       forzahorizon2::streamline::Uninstall();
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
