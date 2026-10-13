@@ -18,5 +18,7 @@ void main(
                      ? renodx::draw::SwapChainPass(scene, position.xy)
                      : saturate(scene));
   hudless.a = 1.f;
-  ui_alpha = saturate(display_plane.Load(pixel).a);
+  const float coverage = saturate(display_plane.Load(pixel).a);
+  // Solid: translucent HUD panels and anti-aliased edges are composited from the real frame entirely.
+  ui_alpha = (CUSTOM_FRAME_GENERATION_UI_MASK != 0.f ? (coverage > (1.f / 255.f) ? 1.f : 0.f) : coverage);
 }

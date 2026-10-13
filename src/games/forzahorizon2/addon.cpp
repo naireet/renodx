@@ -29,6 +29,7 @@
 #include "../../utils/state.hpp"
 #include "../../utils/swapchain.hpp"
 #include "./shared.h"
+#include "./jitter.hpp"
 #include "./streamline.hpp"
 
 namespace {
@@ -858,6 +859,32 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return forzahorizon2::streamline::initialized; },
     },
     new renodx::utils::settings::Setting{
+        .key = "FrameGenerationUiMask",
+        .binding = &shader_injection.frame_generation_ui_mask,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Frame Generation HUD Mask",
+        .section = "Frame Generation",
+        .tooltip = "How the HUD is kept out of generated frames."
+                   "\nSolid: any HUD pixel (including translucent panels and edges) comes from the real frame."
+                   "\nExact: translucent HUD pixels blend over the interpolated scene.",
+        .labels = {"Exact", "Solid"},
+        .is_enabled = []() { return forzahorizon2::streamline::IsActive() && forzahorizon2::streamline::frame_generation_setting != 0.f; },
+        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DlaaJitterTest",
+        .binding = &forzahorizon2::jitter::jitter_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .can_reset = false,
+        .label = "DLAA Jitter (test)",
+        .section = "DLAA",
+        .tooltip = "Development test for DLAA: sub-pixel jitters scene rendering every frame (shimmers without DLAA).",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "ReflexFrameLimit",
         .binding = &forzahorizon2::streamline::reflex_frame_limit_setting,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -938,6 +965,7 @@ void OnPresent(
     uint32_t /*dirty_rect_count*/,
     const reshade::api::rect* /*dirty_rects*/) {
   present_count.fetch_add(1u);
+  forzahorizon2::jitter::OnPresent();
   output_pass_active = output_pass_replaced.exchange(false);
   SyncSwapChainOutputPreset();
   if (swapchain == nullptr || !next_color_space.has_value()) return;
@@ -984,6 +1012,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       // Before mods::shader, so draws are recorded before it replays them for on_drawn callbacks.
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(forzahorizon2::jitter::OnBindRenderTargetsAndDepthStencil);
+      reshade::register_event<reshade::addon_event::bind_viewports>(forzahorizon2::jitter::OnBindViewports);
+      reshade::register_event<reshade::addon_event::reset_command_list>(forzahorizon2::jitter::OnResetCommandList);
+      reshade::register_event<reshade::addon_event::destroy_resource_view>(forzahorizon2::jitter::OnDestroyResourceView);
+      reshade::register_event<reshade::addon_event::init_swapchain>(forzahorizon2::jitter::OnInitSwapchain);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       // Module events first so their per-device data exists when this addon's init_device runs.
@@ -1016,6 +1049,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       forzahorizon2::streamline::Uninstall();
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(forzahorizon2::jitter::OnBindRenderTargetsAndDepthStencil);
+      reshade::unregister_event<reshade::addon_event::bind_viewports>(forzahorizon2::jitter::OnBindViewports);
+      reshade::unregister_event<reshade::addon_event::reset_command_list>(forzahorizon2::jitter::OnResetCommandList);
+      reshade::unregister_event<reshade::addon_event::destroy_resource_view>(forzahorizon2::jitter::OnDestroyResourceView);
+      reshade::unregister_event<reshade::addon_event::init_swapchain>(forzahorizon2::jitter::OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
