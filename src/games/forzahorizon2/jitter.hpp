@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -27,14 +28,17 @@ inline uint32_t swap_chain_width = 0u;
 inline uint32_t swap_chain_height = 0u;
 inline uint32_t frame_index = 0u;
 
+inline constexpr uint32_t MAX_VIEWPORTS = 16u;
+
 struct CommandListState {
   bool main_depth_bound = false;
-  bool has_viewport = false;
-  reshade::api::viewport viewport = {};
+  uint32_t viewport_count = 0u;
+  std::array<reshade::api::viewport, MAX_VIEWPORTS> viewports = {};
 };
 
 inline renodx::utils::data::ParallelFlatHashMap<reshade::api::command_list*, CommandListState, std::shared_mutex> command_list_states;
-inline renodx::utils::data::ParallelFlatHashMap<uint64_t, bool, std::shared_mutex> main_depth_by_view;
+// Keyed by resource: D3D12 descriptor slots are overwritten without destroy events, resources are not.
+inline renodx::utils::data::ParallelFlatHashMap<uint64_t, bool, std::shared_mutex> main_depth_by_resource;
 
 inline float Halton(uint32_t index, uint32_t base) {
   float fraction = 1.f;
@@ -57,27 +61,32 @@ inline bool IsEnabled() {
   return jitter_setting != 0.f && swap_chain_width != 0u;
 }
 
-inline void ApplyViewport(reshade::api::command_list* cmd_list, const CommandListState& state) {
-  if (!state.has_viewport) return;
-  reshade::api::viewport viewport = state.viewport;
+// D3D12 replaces the whole viewport array, so every viewport the game bound is rebound.
+inline void ApplyViewports(reshade::api::command_list* cmd_list, const CommandListState& state) {
+  if (state.viewport_count == 0u) return;
+  std::array<reshade::api::viewport, MAX_VIEWPORTS> viewports = state.viewports;
   if (state.main_depth_bound) {
     const auto offset = CurrentOffset();
-    viewport.x += offset[0];
-    viewport.y += offset[1];
+    for (uint32_t index = 0u; index < state.viewport_count; ++index) {
+      viewports[index].x += offset[0];
+      viewports[index].y += offset[1];
+    }
   }
-  cmd_list->bind_viewports(0u, 1u, &viewport);
+  cmd_list->bind_viewports(0u, state.viewport_count, viewports.data());
 }
 
 inline bool IsMainDepth(reshade::api::device* device, reshade::api::resource_view dsv) {
   if (dsv.handle == 0u) return false;
+  const auto resource = device->get_resource_from_view(dsv);
+  if (resource.handle == 0u) return false;
   bool is_main = false;
-  if (main_depth_by_view.if_contains(dsv.handle, [&](const auto& entry) { is_main = entry.second; })) return is_main;
-  const auto desc = device->get_resource_desc(device->get_resource_from_view(dsv));
+  if (main_depth_by_resource.if_contains(resource.handle, [&](const auto& entry) { is_main = entry.second; })) return is_main;
+  const auto desc = device->get_resource_desc(resource);
   is_main = desc.type == reshade::api::resource_type::texture_2d
             && desc.texture.width == swap_chain_width
             && desc.texture.height == swap_chain_height
             && desc.texture.samples == 1u;
-  main_depth_by_view.insert_or_assign(dsv.handle, is_main);
+  main_depth_by_resource.insert_or_assign(resource.handle, is_main);
   return is_main;
 }
 
@@ -95,26 +104,29 @@ inline void OnBindRenderTargetsAndDepthStencil(
       },
       [&](const auto& construct) { construct(cmd_list, CommandListState{.main_depth_bound = main_depth_bound}); });
   if (changed.has_value()) {
-    ApplyViewport(cmd_list, changed.value());
+    ApplyViewports(cmd_list, changed.value());
   }
 }
 
 inline void OnBindViewports(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::viewport* viewports) {
-  if (!IsEnabled() || first != 0u || count == 0u) return;
+  if (!IsEnabled() || first != 0u || count == 0u || count > MAX_VIEWPORTS) return;
   CommandListState state = {};
+  const auto store = [&](CommandListState* target) {
+    target->viewport_count = count;
+    std::copy_n(viewports, count, target->viewports.begin());
+  };
   command_list_states.lazy_emplace_l(
       cmd_list,
       [&](auto& entry) {
-        entry.second.has_viewport = true;
-        entry.second.viewport = viewports[0];
+        store(&entry.second);
         state = entry.second;
       },
       [&](const auto& construct) {
-        state = {.has_viewport = true, .viewport = viewports[0]};
+        store(&state);
         construct(cmd_list, state);
       });
   if (state.main_depth_bound) {
-    ApplyViewport(cmd_list, state);
+    ApplyViewports(cmd_list, state);
   }
 }
 
@@ -122,15 +134,15 @@ inline void OnResetCommandList(reshade::api::command_list* cmd_list) {
   command_list_states.erase(cmd_list);
 }
 
-inline void OnDestroyResourceView(reshade::api::device* /*device*/, reshade::api::resource_view view) {
-  main_depth_by_view.erase(view.handle);
+inline void OnDestroyResource(reshade::api::device* /*device*/, reshade::api::resource resource) {
+  main_depth_by_resource.erase(resource.handle);
 }
 
 inline void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
   const auto desc = swapchain->get_device()->get_resource_desc(swapchain->get_current_back_buffer());
   swap_chain_width = desc.texture.width;
   swap_chain_height = desc.texture.height;
-  main_depth_by_view.clear();
+  main_depth_by_resource.clear();
 }
 
 inline void OnPresent() {

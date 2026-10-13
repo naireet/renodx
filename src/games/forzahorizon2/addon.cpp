@@ -1015,7 +1015,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(forzahorizon2::jitter::OnBindRenderTargetsAndDepthStencil);
       reshade::register_event<reshade::addon_event::bind_viewports>(forzahorizon2::jitter::OnBindViewports);
       reshade::register_event<reshade::addon_event::reset_command_list>(forzahorizon2::jitter::OnResetCommandList);
-      reshade::register_event<reshade::addon_event::destroy_resource_view>(forzahorizon2::jitter::OnDestroyResourceView);
+      reshade::register_event<reshade::addon_event::destroy_resource>(forzahorizon2::jitter::OnDestroyResource);
       reshade::register_event<reshade::addon_event::init_swapchain>(forzahorizon2::jitter::OnInitSwapchain);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
@@ -1052,7 +1052,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(forzahorizon2::jitter::OnBindRenderTargetsAndDepthStencil);
       reshade::unregister_event<reshade::addon_event::bind_viewports>(forzahorizon2::jitter::OnBindViewports);
       reshade::unregister_event<reshade::addon_event::reset_command_list>(forzahorizon2::jitter::OnResetCommandList);
-      reshade::unregister_event<reshade::addon_event::destroy_resource_view>(forzahorizon2::jitter::OnDestroyResourceView);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(forzahorizon2::jitter::OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(forzahorizon2::jitter::OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
