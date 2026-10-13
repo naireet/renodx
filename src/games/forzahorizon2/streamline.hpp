@@ -111,6 +111,8 @@ inline std::atomic<uint32_t> present_log_count = 0u;
 inline std::atomic<uint32_t> tag_error_log_count = 0u;
 inline std::atomic<uint32_t> constants_error_log_count = 0u;
 inline std::atomic_bool swap_chain_created = false;
+inline uint32_t swap_chain_width = 0u;
+inline uint32_t swap_chain_height = 0u;
 // Streamline's proxies call back into the native objects whose vtable slots are redirected here.
 inline thread_local bool in_streamline_call = false;
 inline CreateCommandQueueFunction original_create_command_queue = nullptr;
@@ -194,6 +196,8 @@ inline HRESULT STDMETHODCALLTYPE OnCreateSwapChainForHwnd(
   if (FAILED(result)) {
     return original_create_swap_chain_for_hwnd(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swap_chain);
   }
+  swap_chain_width = desc->Width;
+  swap_chain_height = desc->Height;
   swap_chain_created = true;
   return result;
 }
@@ -376,9 +380,12 @@ inline void TagFrameInputs(
   sl::Resource motion_vector_resource = {sl::ResourceType::eTex2d, reinterpret_cast<void*>(motion_vectors.handle), SHADER_RESOURCE_STATE};
   sl::Resource depth_resource = {sl::ResourceType::eTex2d, reinterpret_cast<void*>(depth.handle), SHADER_RESOURCE_STATE};
   const sl::Extent extent = {.top = 0u, .left = 0u, .width = width, .height = height};
+  // Backbuffer tag carries only the full-swapchain extent (Streamline already owns the backbuffer).
+  const sl::Extent backbuffer_extent = {.top = 0u, .left = 0u, .width = swap_chain_width, .height = swap_chain_height};
   const sl::ResourceTag tags[] = {
       {&depth_resource, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent},
       {&motion_vector_resource, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent},
+      {nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle{}, &backbuffer_extent},
   };
   const auto result = api.set_tag_for_frame(
       *token, VIEWPORT, tags, static_cast<uint32_t>(std::size(tags)), reinterpret_cast<sl::CommandBuffer*>(cmd_list->get_native()));
