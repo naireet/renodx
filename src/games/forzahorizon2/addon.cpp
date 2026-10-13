@@ -274,6 +274,13 @@ renodx::mods::shader::CustomShaders custom_shaders = {
          .code = __0x3F8871B6,
          .on_drawn = &OnOutputPassDrawn,
      }},
+    // Azimuth present composite when the display gamma ramp is identity (Brightness 50)
+    {0x395B7917,
+     {
+         .crc32 = 0x395B7917,
+         .code = __0x395B7917,
+         .on_drawn = &OnOutputPassDrawn,
+     }},
 };
 
 renodx::utils::settings::Setting* output_mode_setting = nullptr;
