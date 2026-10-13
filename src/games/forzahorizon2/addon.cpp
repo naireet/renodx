@@ -30,8 +30,8 @@ namespace {
 ShaderInjectData shader_injection = {};
 
 // Tonemap target (txFinalTemp, HUD drawn on top) and the display plane copy. Azimuth places game textures over
-// title-memory heaps, so upgrade through committed clones, never in place. Resources with UAV usage are left
-// alone: Azimuth accesses those through integer views that cannot map onto a float clone.
+// title-memory heaps, so upgrade through committed clones, never in place. The typed RGBA16F target matters:
+// Azimuth creates integer UAV views on these targets, and unmapped view formats fall back to new_format.
 std::vector<renodx::utils::resource::ResourceUpgradeInfo> upgrade_infos = {
     {
         .old_format = reshade::api::format::r10g10b10a2_typeless,
@@ -39,7 +39,6 @@ std::vector<renodx::utils::resource::ResourceUpgradeInfo> upgrade_infos = {
         .use_resource_view_cloning = true,
         .aspect_ratio = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER,
         .usage_include = reshade::api::resource_usage::render_target,
-        .usage_exclude = reshade::api::resource_usage::unordered_access,
     },
     {
         .old_format = reshade::api::format::r10g10b10a2_unorm,
@@ -47,7 +46,6 @@ std::vector<renodx::utils::resource::ResourceUpgradeInfo> upgrade_infos = {
         .use_resource_view_cloning = true,
         .aspect_ratio = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER,
         .usage_include = reshade::api::resource_usage::render_target,
-        .usage_exclude = reshade::api::resource_usage::unordered_access,
     },
 };
 bool upgrade_infos_applied = false;
@@ -74,6 +72,8 @@ struct SettingsRootCbvState {
 
 renodx::utils::data::ParallelFlatHashMap<uint64_t, uint32_t, std::shared_mutex> settings_param_by_layout;
 renodx::utils::data::ParallelFlatHashMap<reshade::api::command_list*, SettingsRootCbvState, std::shared_mutex> settings_root_cbvs;
+// Invalidates OnPushDescriptors' per-thread fast path whenever any command list is reset or destroyed.
+std::atomic<uint32_t> command_list_reset_generation = 0u;
 
 void PushRootCbv(reshade::api::command_list* cmd_list, const SettingsRootCbvState& state, const reshade::api::buffer_range& range) {
   cmd_list->push_descriptors(
@@ -95,6 +95,23 @@ void OnPushDescriptors(
     const reshade::api::descriptor_table_update& update) {
   if (!renodx::utils::bitwise::HasAnyFlag(stages, reshade::api::shader_stage::pixel)) return;
 
+  // Azimuth binds ~a dozen pixel root CBVs per draw; skip the shared maps when this thread already recorded
+  // the current command list and layout and the push is not the borrowed slot.
+  struct RecordedLayout {
+    reshade::api::command_list* cmd_list = nullptr;
+    uint64_t layout = 0u;
+    uint32_t settings_param = NO_SETTINGS_PARAM;
+    uint32_t reset_generation = 0u;
+  };
+  thread_local RecordedLayout recorded = {};
+  const uint32_t reset_generation = command_list_reset_generation.load(std::memory_order_relaxed);
+  if (recorded.cmd_list == cmd_list
+      && recorded.layout == layout.handle
+      && recorded.reset_generation == reset_generation
+      && layout_param != recorded.settings_param) {
+    return;
+  }
+
   uint32_t settings_param = NO_SETTINGS_PARAM;
   if (!settings_param_by_layout.if_contains(layout.handle, [&](const auto& pair) { settings_param = pair.second; })) {
     renodx::utils::pipeline_layout::GetPipelineLayoutData(layout, [&](const auto* layout_data) {
@@ -112,6 +129,12 @@ void OnPushDescriptors(
     });
     settings_param_by_layout.insert_or_assign(layout.handle, settings_param);
   }
+  recorded = {
+      .cmd_list = cmd_list,
+      .layout = layout.handle,
+      .settings_param = settings_param,
+      .reset_generation = reset_generation,
+  };
   if (settings_param == NO_SETTINGS_PARAM) return;
 
   const bool is_settings_param = layout_param == settings_param
@@ -171,10 +194,12 @@ void RestoreSettingsRootCbv(reshade::api::command_list* cmd_list) {
 
 void OnResetCommandList(reshade::api::command_list* cmd_list) {
   settings_root_cbvs.erase(cmd_list);
+  command_list_reset_generation.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void OnDestroyCommandList(reshade::api::command_list* cmd_list) {
   settings_root_cbvs.erase(cmd_list);
+  command_list_reset_generation.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void OnDestroyPipelineLayout(reshade::api::device* /*device*/, reshade::api::pipeline_layout layout) {
