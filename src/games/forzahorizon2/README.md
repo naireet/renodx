@@ -14,3 +14,4 @@ HDR10 output for the Xbox One version of Forza Horizon 2 running through Azimuth
   - **Neutwo** (default): vanilla output exactly up to 50%, then a per-channel extension that starts on the Hable tangent and rises toward the scene-linear mid-gray exposure, carrying the LUT/vignette/color-matrix grade. Peak compression uses `ToneMapWorkingColorSpace` (LMS per channel by default, or BT.709 max channel, BT.709 or AP1 per channel).
   - **PsychoV-17**: exposure and cone response matched to the vanilla curve at output 18%, with the game's grade carried over through `UpgradeToneMap`.
 - Azimuth's 1025-entry output curve is applied in both SDR and HDR (linear continuation above 1.0).
+- **Recommended** button (opt-in, user-tuned): Neutwo LMS with Contrast 53, Saturation 55, Shadows 48, Blowout 10. Brightness and EOTF are left untouched.

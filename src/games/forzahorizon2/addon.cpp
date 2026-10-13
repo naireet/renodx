@@ -518,8 +518,30 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Recommended",
+        .section = "Options",
+        .group = "button-line-1",
+        .tooltip = "Tuned FH2 look: slightly more contrast, saturation and blowout than the accuracy-first defaults."
+                   "\nLeaves brightness and EOTF settings untouched.",
+        .on_change = []() {
+          renodx::utils::settings::UpdateSettings({
+              {"ToneMapType", 1.f},
+              {"ToneMapWorkingColorSpace", 3.f},
+              {"ColorGradeExposure", 1.f},
+              {"ColorGradeHighlights", 50.f},
+              {"ColorGradeShadows", 48.f},
+              {"ColorGradeContrast", 53.f},
+              {"ColorGradeSaturation", 55.f},
+              {"ColorGradeBlowout", 10.f},
+              {"ColorGradeScene", 100.f},
+          });
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
         .label = "Reset All",
         .section = "Options",
+        .group = "button-line-1",
         .on_change = []() { renodx::utils::settings::ResetSettings(); },
     },
 };
