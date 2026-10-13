@@ -312,6 +312,7 @@ void main(
   r13.xyz = cmp(r13.xyz == float3(0, 0, 0));
   r1.xyz = r13.xyz ? float3(0, 0, 0) : r12.xyz;
   r0.xyz = r0.www ? r1.xyz : r0.xyz;
+  const float3 vanilla_tonemapped = r0.xyz;  // RenoDX: vanilla filmic result before the LUT
   // Colour grading LUT (16^3, linear in/out) with ColourGrade scale/offset.
   r0.w = cmp(0 < cb1[r15.y + 552].z);
   if (r0.w != 0) {
@@ -408,7 +409,7 @@ void main(
       1.f / v3.z,        // white_scale
     };
     o0.xyz = renodx::draw::RenderIntermediatePass(
-        ApplyFH2ToneMap(untonemapped, r1.xyz, hable_params, hable_enabled));
+        ApplyFH2ToneMap(untonemapped, vanilla_tonemapped, r1.xyz, hable_params, hable_enabled));
     return;
   }
 

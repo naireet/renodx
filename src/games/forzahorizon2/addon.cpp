@@ -292,6 +292,14 @@ bool IsCustomToneMapperEnabled() {
   return shader_injection.tone_map_type != RENODX_TONE_MAP_TYPE_VANILLA;
 }
 
+bool IsNeutwoEnabled() {
+  return shader_injection.tone_map_type == RENODX_TONE_MAP_TYPE_NEUTWO;
+}
+
+bool IsPsychoVEnabled() {
+  return shader_injection.tone_map_type == RENODX_TONE_MAP_TYPE_PSYCHOV17;
+}
+
 void SyncSwapChainOutputPreset() {
   if (output_mode_setting == nullptr
       || tone_map_peak_nits_setting == nullptr
@@ -388,20 +396,28 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
-        .tooltip = "Vanilla keeps the game's Hable filmic curve. RenoDRT extends it into HDR, anchored on the vanilla curve.",
-        .labels = {"Vanilla", "RenoDRT"},
-        .parse = [](float value) { return value == 0.f ? RENODX_TONE_MAP_TYPE_VANILLA : RENODX_TONE_MAP_TYPE_RENO_DRT; },
+        .tooltip = "Vanilla keeps the game's Hable filmic curve (SDR range)."
+                   "\nNeutwo keeps vanilla output exactly up to 50% and extends each channel along the curve's tangent above it."
+                   "\nPsychoV-17 uses the vanilla output-18% exposure and slope with the game's grade carried over.",
+        .labels = {"Vanilla", "Neutwo", "PsychoV-17"},
+        .parse = [](float value) {
+          if (value == 1.f) return RENODX_TONE_MAP_TYPE_NEUTWO;
+          if (value == 2.f) return RENODX_TONE_MAP_TYPE_PSYCHOV17;
+          return RENODX_TONE_MAP_TYPE_VANILLA;
+        },
     },
     new renodx::utils::settings::Setting{
-        .key = "ToneMapHueCorrection",
-        .binding = &shader_injection.tone_map_hue_correction,
-        .default_value = 100.f,
-        .label = "Hue Correction",
+        .key = "ToneMapWorkingColorSpace",
+        .binding = &shader_injection.tone_map_working_color_space,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Working Color Space",
         .section = "Tone Mapping",
-        .tooltip = "Hue retention strength for highlights.",
-        .max = 100.f,
-        .is_enabled = &IsCustomToneMapperEnabled,
-        .parse = [](float value) { return value * 0.01f; },
+        .tooltip = "Space for the Neutwo peak compression."
+                   "\nBT.709 (Max Channel) preserves the SDR grade's hue and saturation."
+                   "\nPer-channel spaces roll highlights toward white.",
+        .labels = {"BT.709 (Max Channel)", "BT.709", "AP1", "LMS"},
+        .is_enabled = &IsNeutwoEnabled,
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeExposure",
@@ -454,15 +470,27 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ColorGradeHighlightSaturation",
-        .binding = &shader_injection.tone_map_highlight_saturation,
+        .key = "ColorGradeConeContrast",
+        .binding = &shader_injection.tone_map_cone_contrast,
         .default_value = 50.f,
-        .label = "Highlight Saturation",
+        .label = "Cone Contrast",
         .section = "Color Grading",
-        .tooltip = "Adds or removes highlight color.",
+        .tooltip = "Scales PsychoV cone-response contrast after vanilla-slope matching.",
         .max = 100.f,
-        .is_enabled = &IsCustomToneMapperEnabled,
+        .is_enabled = &IsPsychoVEnabled,
         .parse = [](float value) { return value * 0.02f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "PsychoVGamutCompression",
+        .binding = &shader_injection.psychov_gamut_compression,
+        .default_value = 1.f,
+        .label = "Gamut Compression",
+        .section = "Color Grading",
+        .tooltip = "Controls PsychoV gamut compression."
+                   "\n0 bypasses gamut mapping; 1 applies the full model.",
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = &IsPsychoVEnabled,
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeBlowout",
@@ -474,17 +502,6 @@ renodx::utils::settings::Settings settings = {
         .max = 100.f,
         .is_enabled = &IsCustomToneMapperEnabled,
         .parse = [](float value) { return value * 0.01f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ColorGradeFlare",
-        .binding = &shader_injection.tone_map_flare,
-        .default_value = 0.f,
-        .label = "Flare",
-        .section = "Color Grading",
-        .tooltip = "Flare/Glare Compensation",
-        .max = 100.f,
-        .is_enabled = &IsCustomToneMapperEnabled,
-        .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeScene",
@@ -512,15 +529,15 @@ void OnPresetOff() {
       {"ToneMapGameNits", 203.f},
       {"ToneMapUINits", 203.f},
       {"GammaCorrection", 0.f},
-      {"ToneMapHueCorrection", 100.f},
+      {"ToneMapWorkingColorSpace", 0.f},
       {"ColorGradeExposure", 1.f},
       {"ColorGradeHighlights", 50.f},
       {"ColorGradeShadows", 50.f},
       {"ColorGradeContrast", 50.f},
       {"ColorGradeSaturation", 50.f},
-      {"ColorGradeHighlightSaturation", 50.f},
+      {"ColorGradeConeContrast", 50.f},
+      {"PsychoVGamutCompression", 1.f},
       {"ColorGradeBlowout", 0.f},
-      {"ColorGradeFlare", 0.f},
       {"ColorGradeScene", 100.f},
   });
   SyncSwapChainOutputPreset();

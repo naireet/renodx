@@ -8,6 +8,18 @@ SamplerState linear_clamp_s : register(s0);
 Texture2D<float4> image : register(t0);
 Texture1D<float4> curve : register(t1);
 
+float3 SampleCurve(float3 encoded) {
+  float3 position = saturate(encoded) * 1024.f;
+  float3 weight = frac(position);
+  int3 index = (int3)position;
+  int3 next_index = min(index + 1, 1024);
+
+  return float3(
+      lerp(curve.Load(int2(index.x, 0)).x, curve.Load(int2(next_index.x, 0)).x, weight.x),
+      lerp(curve.Load(int2(index.y, 0)).y, curve.Load(int2(next_index.y, 0)).y, weight.y),
+      lerp(curve.Load(int2(index.z, 0)).z, curve.Load(int2(next_index.z, 0)).z, weight.z));
+}
+
 void main(
     float4 v0: SV_Position0,
     float2 v1: TEXCOORD0,
@@ -16,17 +28,13 @@ void main(
   o0.w = color.w;
 
   if (RENODX_SWAP_CHAIN_OUTPUT_PRESET == renodx::draw::SWAP_CHAIN_OUTPUT_PRESET_HDR10) {
+    // Keep the curve's SDR-range look; above 1.0 scale by its white so the extension stays continuous.
+    float3 curved = SampleCurve(color.rgb);
+    float3 extended = SampleCurve(1.f) * color.rgb;
+    color.rgb = color.rgb > 1.f ? extended : (color.rgb < 0.f ? color.rgb : curved);
     o0.rgb = renodx::draw::SwapChainPass(color.rgb, v0.xy);
     return;
   }
 
-  float3 position = saturate(color.rgb) * 1024.f;
-  float3 weight = frac(position);
-  int3 index = (int3)position;
-  int3 next_index = min(index + 1, 1024);
-
-  o0.rgb = float3(
-      lerp(curve.Load(int2(index.x, 0)).x, curve.Load(int2(next_index.x, 0)).x, weight.x),
-      lerp(curve.Load(int2(index.y, 0)).y, curve.Load(int2(next_index.y, 0)).y, weight.y),
-      lerp(curve.Load(int2(index.z, 0)).z, curve.Load(int2(next_index.z, 0)).z, weight.z));
+  o0.rgb = SampleCurve(color.rgb);
 }
