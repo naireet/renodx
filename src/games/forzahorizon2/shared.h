@@ -29,11 +29,18 @@ struct ShaderInjectData {
 
 #ifdef __cplusplus
 static_assert(sizeof(ShaderInjectData) == 4u * 16u);
+// Azimuth's graphics root signature already uses all 64 root DWORDs, so game-pass replacements read the
+// settings from this existing pixel root CBV (bound only around the replaced draw), not an injected one.
+static constexpr uint32_t FH2_SETTINGS_ROOT_CBV_REGISTER = 10u;
 #endif
 
 #ifndef __cplusplus
-// Azimuth binds its own per-draw root constants at b13 space0, so the injection must live in space50 (SM 5.1).
+#ifdef FH2_SETTINGS_IN_GAME_ROOT_CBV
+cbuffer injected_buffer : register(b10) {  // FH2_SETTINGS_ROOT_CBV_REGISTER
+#else
+// RenoDX-owned passes (swap chain proxy) have their own root signature.
 cbuffer injected_buffer : register(b13, space50) {
+#endif
   ShaderInjectData shader_injection : packoffset(c0);
 }
 

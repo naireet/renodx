@@ -2,6 +2,7 @@
 // t0 txWorldRender, t1 txCombinedBloom, t2 txLightRays, t3 txVelocity, t5 txLensFlare, t6 txWorldStencil,
 // t7 sunOcclusion, t8/t9 txAlphaBuffer0/1, t10 txAlphaDepthBuffer, t11 txWorldDepth, t12 txColourGrading,
 // cb1 ImageProcPostProcessConstBuffer (indexed by Azimuth's per-draw offset in cb13).
+#define FH2_SETTINGS_IN_GAME_ROOT_CBV
 #include "./common.hlsli"
 
 // Azimuth per-draw root constants (b13 space0).

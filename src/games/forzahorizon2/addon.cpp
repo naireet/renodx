@@ -5,7 +5,10 @@
 
 #define ImTextureID ImU64
 
+#include <atomic>
+#include <cstring>
 #include <optional>
+#include <shared_mutex>
 
 #include <deps/imgui/imgui.h>
 #include <embed/shaders.h>
@@ -13,6 +16,9 @@
 
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
+#include "../../utils/bitwise.hpp"
+#include "../../utils/data.hpp"
+#include "../../utils/pipeline_layout.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/swapchain.hpp"
 #include "./shared.h"
@@ -21,9 +27,176 @@ namespace {
 
 ShaderInjectData shader_injection = {};
 
+// Azimuth's graphics root signature is full (64 DWORDs), so the tonemap replacement reads its settings from
+// the pixel root CBV at FH2_SETTINGS_ROOT_CBV_REGISTER. It is bound right before that draw and rebound to the
+// address Azimuth last set on the command list right after, because Azimuth may skip redundant root rebinds.
+constexpr uint64_t SETTINGS_SLOT_SIZE = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+constexpr uint32_t SETTINGS_SLOT_COUNT = 16u;  // Ring so in-flight frames never read a slot being rewritten.
+constexpr uint32_t NO_SETTINGS_PARAM = UINT32_MAX;
+
+reshade::api::resource settings_buffer = {0u};
+uint8_t* settings_buffer_data = nullptr;
+std::atomic<uint32_t> settings_buffer_next_slot = 0u;
+std::atomic<bool> settings_binding_missing_logged = false;
+
+struct SettingsRootCbvState {
+  reshade::api::pipeline_layout layout = {0u};
+  uint32_t layout_param = NO_SETTINGS_PARAM;
+  bool has_azimuth_binding = false;
+  reshade::api::buffer_range azimuth_binding = {};
+  bool settings_bound = false;
+};
+
+renodx::utils::data::ParallelFlatHashMap<uint64_t, uint32_t, std::shared_mutex> settings_param_by_layout;
+renodx::utils::data::ParallelFlatHashMap<reshade::api::command_list*, SettingsRootCbvState, std::shared_mutex> settings_root_cbvs;
+
+void PushRootCbv(reshade::api::command_list* cmd_list, const SettingsRootCbvState& state, const reshade::api::buffer_range& range) {
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::all_graphics,
+      state.layout,
+      state.layout_param,
+      reshade::api::descriptor_table_update{
+          .count = 1u,
+          .type = reshade::api::descriptor_type::constant_buffer,
+          .descriptors = &range,
+      });
+}
+
+void OnPushDescriptors(
+    reshade::api::command_list* cmd_list,
+    reshade::api::shader_stage stages,
+    reshade::api::pipeline_layout layout,
+    uint32_t layout_param,
+    const reshade::api::descriptor_table_update& update) {
+  if (!renodx::utils::bitwise::HasAnyFlag(stages, reshade::api::shader_stage::pixel)) return;
+
+  uint32_t settings_param = NO_SETTINGS_PARAM;
+  if (!settings_param_by_layout.if_contains(layout.handle, [&](const auto& pair) { settings_param = pair.second; })) {
+    renodx::utils::pipeline_layout::GetPipelineLayoutData(layout, [&](const auto* layout_data) {
+      for (uint32_t index = 0u; index < layout_data->params.size(); ++index) {
+        const auto& param = layout_data->params[index];
+        if (param.type == reshade::api::pipeline_layout_param_type::push_descriptors
+            && param.push_descriptors.type == reshade::api::descriptor_type::constant_buffer
+            && param.push_descriptors.dx_register_index == FH2_SETTINGS_ROOT_CBV_REGISTER
+            && param.push_descriptors.dx_register_space == 0u
+            && renodx::utils::bitwise::HasAnyFlag(param.push_descriptors.visibility, reshade::api::shader_stage::pixel)) {
+          settings_param = index;
+          break;
+        }
+      }
+    });
+    settings_param_by_layout.insert_or_assign(layout.handle, settings_param);
+  }
+  if (settings_param == NO_SETTINGS_PARAM) return;
+
+  const bool is_settings_param = layout_param == settings_param
+                                 && update.type == reshade::api::descriptor_type::constant_buffer
+                                 && update.count == 1u;
+  settings_root_cbvs.lazy_emplace_l(
+      cmd_list,
+      [&](auto& pair) {
+        auto& state = pair.second;
+        if (state.layout.handle != layout.handle) {
+          state = {.layout = layout, .layout_param = settings_param};
+        }
+        if (is_settings_param) {
+          state.has_azimuth_binding = true;
+          state.azimuth_binding = *static_cast<const reshade::api::buffer_range*>(update.descriptors);
+        }
+      },
+      [&](const auto& construct) {
+        SettingsRootCbvState state = {.layout = layout, .layout_param = settings_param};
+        if (is_settings_param) {
+          state.has_azimuth_binding = true;
+          state.azimuth_binding = *static_cast<const reshade::api::buffer_range*>(update.descriptors);
+        }
+        construct(cmd_list, state);
+      });
+}
+
+bool BindSettingsRootCbv(reshade::api::command_list* cmd_list) {
+  std::optional<SettingsRootCbvState> state;
+  settings_root_cbvs.if_contains(cmd_list, [&](const auto& pair) { state = pair.second; });
+  if (!state.has_value() || settings_buffer.handle == 0u || settings_buffer_data == nullptr) {
+    if (!settings_binding_missing_logged.exchange(true)) {
+      reshade::log::message(
+          reshade::log::level::warning,
+          "forzahorizon2: settings root CBV unavailable for the tonemap draw; keeping vanilla for this draw.");
+    }
+    return false;
+  }
+
+  const uint64_t offset = (settings_buffer_next_slot.fetch_add(1u) % SETTINGS_SLOT_COUNT) * SETTINGS_SLOT_SIZE;
+  std::memcpy(settings_buffer_data + offset, &shader_injection, sizeof(shader_injection));
+  PushRootCbv(cmd_list, state.value(), {.buffer = settings_buffer, .offset = offset, .size = SETTINGS_SLOT_SIZE});
+  settings_root_cbvs.modify_if(cmd_list, [](auto& pair) { pair.second.settings_bound = true; });
+  return true;
+}
+
+void RestoreSettingsRootCbv(reshade::api::command_list* cmd_list) {
+  std::optional<SettingsRootCbvState> state;
+  settings_root_cbvs.modify_if(cmd_list, [&](auto& pair) {
+    if (!pair.second.settings_bound) return;
+    pair.second.settings_bound = false;
+    state = pair.second;
+  });
+  if (!state.has_value() || !state->has_azimuth_binding) return;
+  PushRootCbv(cmd_list, state.value(), state->azimuth_binding);
+}
+
+void OnResetCommandList(reshade::api::command_list* cmd_list) {
+  settings_root_cbvs.erase(cmd_list);
+}
+
+void OnDestroyCommandList(reshade::api::command_list* cmd_list) {
+  settings_root_cbvs.erase(cmd_list);
+}
+
+void OnDestroyPipelineLayout(reshade::api::device* /*device*/, reshade::api::pipeline_layout layout) {
+  settings_param_by_layout.erase(layout.handle);
+}
+
+void OnInitDevice(reshade::api::device* device) {
+  if (device->get_api() != reshade::api::device_api::d3d12 || settings_buffer.handle != 0u) return;
+
+  constexpr uint64_t size = SETTINGS_SLOT_SIZE * SETTINGS_SLOT_COUNT;
+  if (!device->create_resource(
+          reshade::api::resource_desc(size, reshade::api::memory_heap::cpu_to_gpu, reshade::api::resource_usage::constant_buffer),
+          nullptr,
+          reshade::api::resource_usage::constant_buffer,
+          &settings_buffer)) {
+    reshade::log::message(reshade::log::level::error, "forzahorizon2: failed to create settings constant buffer.");
+    return;
+  }
+  void* mapped_data = nullptr;
+  if (!device->map_buffer_region(settings_buffer, 0u, size, reshade::api::map_access::write_only, &mapped_data)) {
+    reshade::log::message(reshade::log::level::error, "forzahorizon2: failed to map settings constant buffer.");
+    device->destroy_resource(settings_buffer);
+    settings_buffer = {0u};
+    return;
+  }
+  // Upload heaps may stay persistently mapped.
+  settings_buffer_data = static_cast<uint8_t*>(mapped_data);
+}
+
+void OnDestroyDevice(reshade::api::device* device) {
+  if (settings_buffer.handle == 0u) return;
+  device->unmap_buffer_region(settings_buffer);
+  device->destroy_resource(settings_buffer);
+  settings_buffer = {0u};
+  settings_buffer_data = nullptr;
+}
+
 // Hashes are Azimuth 0.9.7 runtime translations; re-hash after Azimuth updates.
 renodx::mods::shader::CustomShaders custom_shaders = {
-    CustomShaderEntry(0x362A82D8),  // FH2 tonemap/composite (bloom, rays, flare, Hable, LUT, vignette)
+    // FH2 tonemap/composite (bloom, rays, flare, Hable, LUT, vignette)
+    {0x362A82D8,
+     {
+         .crc32 = 0x362A82D8,
+         .code = __0x362A82D8,
+         .on_replace = &BindSettingsRootCbv,
+         .on_drawn = &RestoreSettingsRootCbv,
+     }},
     CustomShaderEntry(0x3F8871B6),  // Azimuth display plane -> swapchain composite (gamma ramp curve)
 };
 
@@ -306,15 +479,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       if (!reshade::register_addon(h_module)) return FALSE;
 
       if (!initialized) {
-        renodx::mods::shader::on_init_pipeline_layout = [](reshade::api::device* device, auto, auto) {
-          return device->get_api() == reshade::api::device_api::d3d12;
-        };
         renodx::mods::shader::force_pipeline_cloning = true;
-        renodx::mods::shader::expected_constant_buffer_index = 13;
-        renodx::mods::shader::expected_constant_buffer_space = 50;
-        // Azimuth's root signatures already carry per-stage root constants at b13 space0.
-        renodx::mods::shader::allow_multiple_push_constants = true;
-        renodx::mods::shader::use_root_signature_cbv = true;
 
         renodx::mods::swapchain::SetUseHDR10(true);
         renodx::mods::swapchain::set_color_space = false;
@@ -348,9 +513,21 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
       SyncSwapChainOutputPreset();
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+      reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
+      reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+      reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
+      reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
       next_color_space = std::nullopt;
       current_color_space = std::nullopt;
@@ -360,7 +537,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   }
 
   renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
-  renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
+  // No injection pointer: Azimuth's root signatures have no room for an injected parameter (see BindSettingsRootCbv).
+  renodx::mods::shader::Use(fdw_reason, custom_shaders);
 
   return TRUE;
 }
