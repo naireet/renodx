@@ -9,6 +9,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -93,6 +94,14 @@ inline uint32_t frame_index = 0u;
 inline std::atomic<sl::FrameToken*> frame_token = nullptr;
 // User toggle (settings); frame generation also requires inputs tagged during the frame being presented.
 inline float frame_generation_setting = 1.f;
+// Index into 2x/3x/4x (numFramesToGenerate 1..3).
+inline float frame_generation_multiplier_setting = 0.f;
+// sl::ReflexMode: Off / On / On + Boost.
+inline float reflex_setting = 1.f;
+// Reflex frame limiter: Off / 60 fps. Azimuth always paces its simulation to 60; this lets Reflex pace too.
+inline float reflex_frame_limit_setting = 0.f;
+inline constexpr uint32_t REFLEX_FRAME_LIMIT_60_US = 16666u;
+inline constexpr uint32_t MAX_GENERATED_FRAMES = 3u;
 inline std::atomic_bool inputs_tagged = false;
 inline bool frame_generation_on = false;
 inline uint32_t tagged_width = 0u;
@@ -442,25 +451,47 @@ inline void LogFrameGenerationState(const sl::DLSSGOptions& options) {
       ", inputs ", tagged_width, "x", tagged_height);
 }
 
-inline void SetFrameGenerationMode(bool enabled) {
-  frame_generation_on = enabled;
+struct OutputMode {
+  bool frame_generation = false;
+  uint32_t generated_frames = 1u;
+  sl::ReflexMode reflex = sl::ReflexMode::eOff;
+  uint32_t frame_limit_us = 0u;
+};
+
+inline bool operator==(const OutputMode& lhs, const OutputMode& rhs) {
+  return lhs.frame_generation == rhs.frame_generation && lhs.generated_frames == rhs.generated_frames && lhs.reflex == rhs.reflex
+         && lhs.frame_limit_us == rhs.frame_limit_us;
+}
+
+inline OutputMode applied_mode = {};
+inline bool applied_mode_valid = false;
+
+inline void ApplyOutputMode(const OutputMode& mode) {
+  applied_mode = mode;
+  applied_mode_valid = true;
+  frame_generation_on = mode.frame_generation;
   if (api.reflex_set_options != nullptr) {
     sl::ReflexOptions reflex_options = {};
-    reflex_options.mode = (enabled ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff);
-    api.reflex_set_options(reflex_options);
+    reflex_options.mode = mode.reflex;
+    reflex_options.frameLimitUs = mode.frame_limit_us;
+    renodx::utils::log::i("streamline: slReflexSetOptions(mode ", static_cast<uint32_t>(mode.reflex), ", frameLimitUs ", mode.frame_limit_us, "): ",
+                          static_cast<uint32_t>(api.reflex_set_options(reflex_options)));
   }
   sl::DLSSGOptions options = {};
-  options.mode = (enabled ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
-  options.numFramesToGenerate = 1u;
+  options.mode = (mode.frame_generation ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
+  options.numFramesToGenerate = mode.generated_frames;
   const auto result = api.dlssg_set_options(VIEWPORT, options);
-  renodx::utils::log::i("streamline: slDLSSGSetOptions(", (enabled ? "on" : "off"), "): ", static_cast<uint32_t>(result));
+  renodx::utils::log::i("streamline: slDLSSGSetOptions(", (mode.frame_generation ? "on" : "off"), ", generated ",
+                        mode.generated_frames, "): ", static_cast<uint32_t>(result));
   LogFrameGenerationState(options);
 }
 
 // DLSS-G must be off while the swapchain is resized or changes fullscreen state; OnPresent re-enables it.
 inline void OnDestroySwapchain(reshade::api::swapchain* /*swapchain*/, bool /*resize*/) {
   if (!IsActive() || !frame_generation_on || api.dlssg_set_options == nullptr) return;
-  SetFrameGenerationMode(false);
+  OutputMode mode = applied_mode;
+  mode.frame_generation = false;
+  ApplyOutputMode(mode);
 }
 
 inline void OnPresent(
@@ -482,15 +513,23 @@ inline void OnPresent(
       LogFrameGenerationState({});
     }
     // Frames without tagged inputs (no 3D scene: loading, video) must not be interpolated.
-    const bool want_frame_generation = frame_generation_setting != 0.f && inputs_tagged;
-    if (want_frame_generation) {
+    OutputMode mode = {
+        .frame_generation = frame_generation_setting != 0.f && inputs_tagged,
+        .generated_frames = std::clamp(static_cast<uint32_t>(frame_generation_multiplier_setting) + 1u, 1u, MAX_GENERATED_FRAMES),
+        .reflex = static_cast<sl::ReflexMode>(std::clamp(static_cast<int>(reflex_setting), 0, 2)),
+        .frame_limit_us = (reflex_frame_limit_setting != 0.f ? REFLEX_FRAME_LIMIT_60_US : 0u),
+    };
+    // DLSS-G requires Reflex; "Off" only applies while frame generation is off.
+    if (mode.frame_generation && mode.reflex == sl::ReflexMode::eOff) {
+      mode.reflex = sl::ReflexMode::eLowLatency;
+    }
+    if (mode.frame_generation) {
       SetCommonConstants(token);
     }
-    if (want_frame_generation != frame_generation_on) {
-      SetFrameGenerationMode(want_frame_generation);
+    if (!applied_mode_valid || !(mode == applied_mode)) {
+      ApplyOutputMode(mode);
     }
   }
-
   if (token != nullptr && present_log_count.fetch_add(1u) < 3u) {
     renodx::utils::log::i("streamline: present frame ", static_cast<uint32_t>(*token), " on thread ", GetCurrentThreadId(), ", inputs tagged: ", inputs_tagged.load());
   }
