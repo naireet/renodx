@@ -230,6 +230,11 @@ struct FrameGenerationInputs {
   reshade::api::resource_view hudless_scene_rtv = {0u};
   // Display plane (A copied, HUD included), captured as the render target of Azimuth's A -> P copy draw.
   reshade::api::resource display_plane = {0u};
+  // Resolved scene colour (R11G11B10) that bloom and the tonemap read; captured from the resolve draw 0x0B23432B.
+  reshade::api::resource scene_color = {0u};
+  reshade::api::resource dlaa_output = {0u};
+  renodx::utils::render::RenderPass dlaa_copy_pass;
+  reshade::api::resource dlaa_copy_pass_scene_color = {0u};
   uint32_t width = 0u;
   uint32_t height = 0u;
   uint64_t layout = 0u;
@@ -310,8 +315,17 @@ void RetireUiPass() {
   inputs.ui_pass_display_plane = {0u};
 }
 
+void RetireDlaaCopyPass() {
+  auto& inputs = frame_generation_inputs;
+  retired_frame_generation_inputs.push_back({.passes = {}, .retired_at_present = present_count.load()});
+  retired_frame_generation_inputs.back().passes.push_back(std::move(inputs.dlaa_copy_pass));
+  inputs.dlaa_copy_pass = {};
+  inputs.dlaa_copy_pass_scene_color = {0u};
+}
+
 void RetireFrameGenerationInputs() {
   auto& inputs = frame_generation_inputs;
+  RetireDlaaCopyPass();
   RetireUiPass();
   auto& retired = retired_frame_generation_inputs.back();
   retired.passes.push_back(std::move(inputs.motion_vector_pass));
@@ -319,7 +333,7 @@ void RetireFrameGenerationInputs() {
     retired.views.push_back(inputs.hudless_scene_rtv);
   }
   inputs.hudless_scene_rtv = {0u};
-  for (auto* resource : {&inputs.motion_vectors, &inputs.depth, &inputs.hudless_scene, &inputs.hudless, &inputs.ui_alpha}) {
+  for (auto* resource : {&inputs.motion_vectors, &inputs.depth, &inputs.hudless_scene, &inputs.hudless, &inputs.ui_alpha, &inputs.dlaa_output}) {
     if (resource->handle != 0u) {
       retired.resources.push_back(*resource);
     }
@@ -344,7 +358,34 @@ reshade::api::resource ResolveUpgradedResource(reshade::api::resource resource) 
   return (clone.handle != 0u ? clone : resource);
 }
 
-void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
+// Owned targets live in shader-resource state between passes; the DLAA output stays in unordered-access state.
+constexpr uint32_t D3D12_SHADER_RESOURCE_STATE = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+// Streamline binds its own descriptor heaps on the native list during evaluate, behind ReShade's heap tracking,
+// so Azimuth's shader-visible heaps are set back natively before the tracked state is reapplied.
+void RestoreAfterStreamlineEvaluate(reshade::api::command_list* cmd_list, const renodx::utils::state::CommandListSnapshot& snapshot) {
+  auto* device = cmd_list->get_device();
+  std::array<ID3D12DescriptorHeap*, 2> heaps = {};
+  uint32_t heap_count = 0u;
+  if (const auto tables = renodx::utils::state::CopyBoundDescriptorTables(cmd_list, renodx::utils::state::PipelineBindPoint::GRAPHICS); tables.has_value()) {
+    for (const auto& [index, table] : tables->tables.entries()) {
+      if (table.handle == 0u) continue;
+      reshade::api::descriptor_heap heap = {0u};
+      device->get_descriptor_heap_offset(table, 0u, 0u, &heap, nullptr);
+      auto* native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+      if (native_heap == nullptr || std::find(heaps.begin(), heaps.begin() + heap_count, native_heap) != heaps.begin() + heap_count) continue;
+      if (heap_count == heaps.size()) break;
+      heaps[heap_count++] = native_heap;
+    }
+  }
+  if (heap_count != 0u) {
+    reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())->SetDescriptorHeaps(heap_count, heaps.data());
+  }
+  snapshot.Apply();
+}
+
+// Before the tonemap draw (its bindings are set): DLSS inputs for frame generation and DLAA, then DLAA itself.
+void RecordDlssInputs(reshade::api::command_list* cmd_list) {
   if (!forzahorizon2::streamline::IsActive()) return;
 
   reshade::api::pipeline_layout layout = {0u};
@@ -362,17 +403,20 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
   DestroyRetiredFrameGenerationInputs(device, false);
   if (inputs.width != width || inputs.height != height || inputs.layout != layout.handle) {
     RetireFrameGenerationInputs();
-    const auto create_target = [&](reshade::api::format format, reshade::api::resource_usage usage, reshade::api::resource* resource) {
+    const auto create_target = [&](reshade::api::format format, reshade::api::resource_usage usage, reshade::api::resource_usage state, reshade::api::resource* resource) {
       return device->create_resource(
           reshade::api::resource_desc(width, height, 1u, 1u, format, 1u, reshade::api::memory_heap::gpu_only, usage),
-          nullptr, reshade::api::resource_usage::shader_resource, resource);
+          nullptr, state, resource);
     };
     constexpr auto RENDER_TARGET_USAGE = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
-    const bool created = create_target(reshade::api::format::r16g16_float, RENDER_TARGET_USAGE, &inputs.motion_vectors)
-                         && create_target(reshade::api::format::r32_float, RENDER_TARGET_USAGE, &inputs.depth)
-                         && create_target(reshade::api::format::r16g16b16a16_float, RENDER_TARGET_USAGE, &inputs.hudless_scene)
-                         && create_target(reshade::api::format::r10g10b10a2_unorm, RENDER_TARGET_USAGE, &inputs.hudless)
-                         && create_target(reshade::api::format::r16_float, RENDER_TARGET_USAGE, &inputs.ui_alpha)
+    constexpr auto STORAGE_USAGE = reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource;
+    constexpr auto READABLE = reshade::api::resource_usage::shader_resource;
+    const bool created = create_target(reshade::api::format::r16g16_float, RENDER_TARGET_USAGE, READABLE, &inputs.motion_vectors)
+                         && create_target(reshade::api::format::r32_float, RENDER_TARGET_USAGE, READABLE, &inputs.depth)
+                         && create_target(reshade::api::format::r16g16b16a16_float, RENDER_TARGET_USAGE, READABLE, &inputs.hudless_scene)
+                         && create_target(reshade::api::format::r10g10b10a2_unorm, RENDER_TARGET_USAGE, READABLE, &inputs.hudless)
+                         && create_target(reshade::api::format::r16_float, RENDER_TARGET_USAGE, READABLE, &inputs.ui_alpha)
+                         && create_target(reshade::api::format::r16g16b16a16_float, STORAGE_USAGE, reshade::api::resource_usage::unordered_access, &inputs.dlaa_output)
                          && device->create_resource_view(
                              inputs.hudless_scene, reshade::api::resource_usage::render_target,
                              reshade::api::resource_view_desc(reshade::api::format::r16g16b16a16_float), &inputs.hudless_scene_rtv);
@@ -398,20 +442,6 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
     reshade::log::message(reshade::log::level::info, "forzahorizon2: created DLSS input targets.");
   }
 
-  // HUD-less scene: the replaced tonemap PSO and every binding are still set, so re-issue that draw into the owned
-  // RGBA16F target (same format as the upgraded tonemap target), then restore Azimuth's render targets.
-  inputs.hudless_scene_ready = false;
-  if (last_draw.cmd_list == cmd_list && target_desc.texture.format == reshade::api::format::r16g16b16a16_float) {
-    if (auto snapshot = renodx::utils::state::GetSnapshot(cmd_list); snapshot.has_value()) {
-      cmd_list->barrier(inputs.hudless_scene, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
-      cmd_list->bind_render_targets_and_depth_stencil(1u, &inputs.hudless_scene_rtv);
-      cmd_list->draw(last_draw.vertex_count, last_draw.instance_count, last_draw.first_vertex, last_draw.first_instance);
-      cmd_list->barrier(inputs.hudless_scene, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
-      snapshot->ApplyGraphics(false);
-      inputs.hudless_scene_ready = true;
-    }
-  }
-
   const reshade::api::resource targets[2] = {inputs.motion_vectors, inputs.depth};
   const reshade::api::resource_usage readable[2] = {reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource};
   const reshade::api::resource_usage writable[2] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::render_target};
@@ -422,7 +452,85 @@ void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
     LogFrameGenerationFailure("forzahorizon2: DLSS motion vector pass failed.");
     return;
   }
-  forzahorizon2::streamline::TagFrameInputs(cmd_list, inputs.motion_vectors, inputs.depth, width, height);
+  const bool dlaa = forzahorizon2::jitter::dlaa_setting != 0.f;
+  const auto jitter = (forzahorizon2::jitter::IsEnabled() ? forzahorizon2::jitter::CurrentOffset() : std::array<float, 2>{0.f, 0.f});
+  const auto jitter_sign = static_cast<uint32_t>(forzahorizon2::jitter::jitter_sign_setting);
+  forzahorizon2::streamline::TagFrameInputs(
+      cmd_list, inputs.motion_vectors, inputs.depth, width, height,
+      jitter[0] * ((jitter_sign & 1u) != 0u ? -1.f : 1.f),
+      jitter[1] * ((jitter_sign & 2u) != 0u ? -1.f : 1.f));
+
+  if (!dlaa || inputs.scene_color.handle == 0u) return;
+  const auto scene_desc = device->get_resource_desc(inputs.scene_color);
+  if (scene_desc.texture.width != width || scene_desc.texture.height != height) {
+    LogFrameGenerationFailure("forzahorizon2: scene colour size differs from the tonemap target; DLAA disabled.");
+    return;
+  }
+  if (inputs.dlaa_copy_pass_scene_color.handle != inputs.scene_color.handle) {
+    RetireDlaaCopyPass();
+    inputs.dlaa_copy_pass_scene_color = inputs.scene_color;
+    auto& copy_pass = inputs.dlaa_copy_pass;
+    copy_pass.use_render_pass = false;
+    copy_pass.revert_state_after_render = true;
+    copy_pass.pipeline_subobjects.vertex_shader = __fullscreen_triangle;
+    copy_pass.pipeline_subobjects.pixel_shader = __copy_texture;
+    copy_pass.shader_resource_slots.resources = {inputs.dlaa_output};
+    copy_pass.shader_resource_slots.view_descs = {reshade::api::resource_view_desc(reshade::api::format::r16g16b16a16_float)};
+    copy_pass.render_target_slots.resources = {inputs.scene_color};
+    copy_pass.render_target_slots.view_descs = {
+        reshade::api::resource_view_desc(reshade::api::format_to_default_typed(scene_desc.texture.format, 0))};
+  }
+
+  // The scene colour is read by this tonemap draw (and was read by bloom), so it is in shader-resource state here.
+  const auto snapshot = renodx::utils::state::GetSnapshot(cmd_list);
+  if (!snapshot.has_value()) return;
+  const bool evaluated = forzahorizon2::streamline::EvaluateDlaa(
+      cmd_list, inputs.scene_color, D3D12_SHADER_RESOURCE_STATE, inputs.dlaa_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, width, height);
+  RestoreAfterStreamlineEvaluate(cmd_list, snapshot.value());
+  if (!evaluated) return;
+
+  const reshade::api::resource copy_resources[2] = {inputs.dlaa_output, inputs.scene_color};
+  const reshade::api::resource_usage copy_before[2] = {reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource};
+  const reshade::api::resource_usage copy_during[2] = {reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target};
+  cmd_list->barrier(2u, copy_resources, copy_before, copy_during);
+  if (!inputs.dlaa_copy_pass.Render(cmd_list)) {
+    LogFrameGenerationFailure("forzahorizon2: DLAA copy pass failed.");
+  }
+  cmd_list->barrier(2u, copy_resources, copy_during, copy_before);
+}
+
+// After the tonemap draw: the HUD-less scene for DLSS-G, by re-issuing that draw (replaced tonemap PSO and every
+// binding still set) into the owned RGBA16F target, then restoring Azimuth's render targets.
+void RecordHudlessScene(reshade::api::command_list* cmd_list) {
+  if (!forzahorizon2::streamline::IsActive()) return;
+  const auto target_view = renodx::utils::state::GetRenderTarget(cmd_list, 0u);
+  if (target_view.handle == 0u) return;
+  auto* device = cmd_list->get_device();
+  const auto target_desc = device->get_resource_desc(ResolveUpgradedResource(device->get_resource_from_view(target_view)));
+
+  const std::unique_lock lock(frame_generation_inputs.mutex);
+  auto& inputs = frame_generation_inputs;
+  inputs.hudless_scene_ready = false;
+  if (inputs.hudless_scene_rtv.handle == 0u || last_draw.cmd_list != cmd_list
+      || target_desc.texture.format != reshade::api::format::r16g16b16a16_float
+      || target_desc.texture.width != inputs.width || target_desc.texture.height != inputs.height) return;
+  auto snapshot = renodx::utils::state::GetSnapshot(cmd_list);
+  if (!snapshot.has_value()) return;
+  cmd_list->barrier(inputs.hudless_scene, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
+  cmd_list->bind_render_targets_and_depth_stencil(1u, &inputs.hudless_scene_rtv);
+  cmd_list->draw(last_draw.vertex_count, last_draw.instance_count, last_draw.first_vertex, last_draw.first_instance);
+  cmd_list->barrier(inputs.hudless_scene, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+  snapshot->ApplyGraphics(false);
+  inputs.hudless_scene_ready = true;
+}
+
+void CaptureSceneColor(reshade::api::command_list* cmd_list) {
+  if (!forzahorizon2::streamline::IsActive()) return;
+  const auto view = renodx::utils::state::GetRenderTarget(cmd_list, 0u);
+  if (view.handle == 0u) return;
+  const auto scene_color = ResolveUpgradedResource(cmd_list->get_device()->get_resource_from_view(view));
+  const std::unique_lock lock(frame_generation_inputs.mutex);
+  frame_generation_inputs.scene_color = scene_color;
 }
 
 void CaptureDisplayPlane(reshade::api::command_list* cmd_list) {
@@ -540,6 +648,13 @@ void OnOutputPassDrawn(reshade::api::command_list* cmd_list) {
 
 // Hashes are Azimuth 0.9.7 runtime translations; re-hash after Azimuth updates.
 renodx::mods::shader::CustomShaders custom_shaders = {
+    // FH2 scene colour resolve (also used without MSAA); its render target is the scene colour post passes read.
+    {0x0B23432B,
+     {
+         .crc32 = 0x0B23432B,
+         .on_inject = [](reshade::api::command_list*) { return false; },
+         .on_drawn = &CaptureSceneColor,
+     }},
     // FH2 copy of the tonemap target (HUD included) to the display plane; full and limited range variants.
     {0xD2A7D2FC,
      {
@@ -558,11 +673,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
      {
          .crc32 = 0x362A82D8,
          .code = __0x362A82D8,
-         .on_replace = &BindSettingsRootCbv,
+         .on_replace = [](reshade::api::command_list* cmd_list) {
+           RecordDlssInputs(cmd_list);
+           return BindSettingsRootCbv(cmd_list);
+         },
          // Its layout is Azimuth's full root signature; settings come from the borrowed root CBV instead.
          .on_inject = [](reshade::api::command_list*) { return false; },
          .on_drawn = [](reshade::api::command_list* cmd_list) {
-           RecordFrameGenerationInputs(cmd_list);
+           RecordHudlessScene(cmd_list);
            RestoreSettingsRootCbv(cmd_list);
          },
      }},
@@ -870,6 +988,31 @@ renodx::utils::settings::Settings settings = {
                    "\nExact: translucent HUD pixels blend over the interpolated scene.",
         .labels = {"Exact", "Solid"},
         .is_enabled = []() { return forzahorizon2::streamline::IsActive() && forzahorizon2::streamline::frame_generation_setting != 0.f; },
+        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "Dlaa",
+        .binding = &forzahorizon2::jitter::dlaa_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "DLAA",
+        .section = "DLAA",
+        .tooltip = "Experimental. NVIDIA DLAA (DLSS at native resolution) on the scene before post-processing."
+                   "\nRequires antialiasing=off in azimuth.ini and sl.dlss.dll / nvngx_dlss.dll in renodx-streamline.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
+        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DlaaJitterSign",
+        .binding = &forzahorizon2::jitter::jitter_sign_setting,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "DLAA Jitter Sign (debug)",
+        .section = "DLAA",
+        .tooltip = "Sign of the sub-pixel jitter reported to DLSS. Pick the option with the sharpest, most stable image.",
+        .labels = {"Default", "Flip X", "Flip Y", "Flip Both"},
+        .is_enabled = []() { return forzahorizon2::jitter::dlaa_setting != 0.f; },
         .is_visible = []() { return forzahorizon2::streamline::initialized; },
     },
     new renodx::utils::settings::Setting{

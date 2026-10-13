@@ -22,6 +22,7 @@
 #include <include/reshade.hpp>
 
 #include <sl.h>
+#include <sl_dlss.h>
 #include <sl_dlss_g.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
@@ -72,6 +73,8 @@ struct Api {
   PFun_slGetNewFrameToken* get_new_frame_token = nullptr;
   PFun_slSetTagForFrame* set_tag_for_frame = nullptr;
   PFun_slSetConstants* set_constants = nullptr;
+  PFun_slEvaluateFeature* evaluate_feature = nullptr;
+  PFun_slDLSSSetOptions* dlss_set_options = nullptr;
   PFun_slDLSSGSetOptions* dlssg_set_options = nullptr;
   PFun_slDLSSGGetState* dlssg_get_state = nullptr;
   PFun_slReflexSetOptions* reflex_set_options = nullptr;
@@ -235,6 +238,7 @@ inline bool OnCreateDevice(reshade::api::device_api device_api, uint32_t& /*api_
   api.get_new_frame_token = reinterpret_cast<PFun_slGetNewFrameToken*>(GetProcAddress(interposer, "slGetNewFrameToken"));
   api.set_tag_for_frame = reinterpret_cast<PFun_slSetTagForFrame*>(GetProcAddress(interposer, "slSetTagForFrame"));
   api.set_constants = reinterpret_cast<PFun_slSetConstants*>(GetProcAddress(interposer, "slSetConstants"));
+  api.evaluate_feature = reinterpret_cast<PFun_slEvaluateFeature*>(GetProcAddress(interposer, "slEvaluateFeature"));
   if (api.init == nullptr || api.set_d3d_device == nullptr || api.upgrade_interface == nullptr || api.get_native_interface == nullptr
       || api.is_feature_supported == nullptr || api.get_feature_function == nullptr || api.get_new_frame_token == nullptr
       || api.set_tag_for_frame == nullptr || api.set_constants == nullptr) {
@@ -244,7 +248,7 @@ inline bool OnCreateDevice(reshade::api::device_api device_api, uint32_t& /*api_
 
   const std::wstring plugin_folder_string = plugin_folder.wstring();
   const wchar_t* plugin_paths[] = {plugin_folder_string.c_str()};
-  const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+  const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL, sl::kFeatureDLSS};
   sl::Preferences preferences = {};
   preferences.logLevel = sl::LogLevel::eDefault;
   preferences.pathsToPlugins = plugin_paths;
@@ -329,12 +333,13 @@ inline void OnInitDevice(reshade::api::device* device) {
   api.get_feature_function(sl::kFeatureReflex, "slReflexSetOptions", reinterpret_cast<void*&>(api.reflex_set_options));
   api.get_feature_function(sl::kFeatureReflex, "slReflexSleep", reinterpret_cast<void*&>(api.reflex_sleep));
   api.get_feature_function(sl::kFeaturePCL, "slPCLSetMarker", reinterpret_cast<void*&>(api.pcl_set_marker));
+  api.get_feature_function(sl::kFeatureDLSS, "slDLSSSetOptions", reinterpret_cast<void*&>(api.dlss_set_options));
 
   LUID adapter_luid = native_device->GetAdapterLuid();
   sl::AdapterInfo adapter_info = {};
   adapter_info.deviceLUID = reinterpret_cast<uint8_t*>(&adapter_luid);
   adapter_info.deviceLUIDSizeInBytes = sizeof(adapter_luid);
-  for (const auto& [feature, name] : {std::pair{sl::kFeatureDLSS_G, "DLSS-G"}, std::pair{sl::kFeatureReflex, "Reflex"}, std::pair{sl::kFeaturePCL, "PCL"}}) {
+  for (const auto& [feature, name] : {std::pair{sl::kFeatureDLSS_G, "DLSS-G"}, std::pair{sl::kFeatureReflex, "Reflex"}, std::pair{sl::kFeaturePCL, "PCL"}, std::pair{sl::kFeatureDLSS, "DLSS"}}) {
     renodx::utils::log::i("streamline: ", name, " supported: ", static_cast<uint32_t>(api.is_feature_supported(feature, adapter_info)), " (0 = ok)");
   }
 }
@@ -369,13 +374,58 @@ inline void BeginFrame() {
   SetMarker(sl::PCLMarker::eRenderSubmitStart);
 }
 
+inline sl::float4x4 IdentityMatrix() {
+  sl::float4x4 matrix = {};
+  matrix.setRow(0u, {1.f, 0.f, 0.f, 0.f});
+  matrix.setRow(1u, {0.f, 1.f, 0.f, 0.f});
+  matrix.setRow(2u, {0.f, 0.f, 1.f, 0.f});
+  matrix.setRow(3u, {0.f, 0.f, 0.f, 1.f});
+  return matrix;
+}
+
+// G1: camera matrices are not read back yet; motion vectors are dense (camera + objects), so only their
+// conventions matter. FH2 uses standard depth (0 near, 1 far), per its depth linearization in 0x34ADA64E.
+inline void SetCommonConstants(sl::FrameToken* token, float jitter_x, float jitter_y) {
+  sl::Constants constants = {};
+  constants.cameraViewToClip = IdentityMatrix();
+  constants.clipToCameraView = IdentityMatrix();
+  constants.clipToLensClip = IdentityMatrix();
+  constants.clipToPrevClip = IdentityMatrix();
+  constants.prevClipToClip = IdentityMatrix();
+  constants.jitterOffset = {jitter_x, jitter_y};
+  constants.mvecScale = {1.f, 1.f};
+  constants.cameraPinholeOffset = {0.f, 0.f};
+  constants.cameraPos = {0.f, 0.f, 0.f};
+  constants.cameraUp = {0.f, 1.f, 0.f};
+  constants.cameraRight = {1.f, 0.f, 0.f};
+  constants.cameraFwd = {0.f, 0.f, 1.f};
+  constants.cameraNear = 0.1f;
+  constants.cameraFar = 10000.f;
+  constants.cameraFOV = 1.0472f;
+  constants.cameraAspectRatio = (tagged_height != 0u ? static_cast<float>(tagged_width) / static_cast<float>(tagged_height) : 16.f / 9.f);
+  constants.motionVectorsInvalidValue = 0.f;
+  constants.depthInverted = sl::Boolean::eFalse;
+  constants.cameraMotionIncluded = sl::Boolean::eTrue;
+  constants.motionVectors3D = sl::Boolean::eFalse;
+  constants.reset = sl::Boolean::eFalse;
+  constants.orthographicProjection = sl::Boolean::eFalse;
+  constants.motionVectorsDilated = sl::Boolean::eFalse;
+  constants.motionVectorsJittered = sl::Boolean::eFalse;
+  if (const auto result = api.set_constants(constants, *token, VIEWPORT);
+      result != sl::Result::eOk && constants_error_log_count.fetch_add(1u) < 3u) {
+    renodx::utils::log::e("streamline: slSetConstants failed (", static_cast<uint32_t>(result), ").");
+  }
+}
+
 // Called while recording the frame's tonemap draw. Both resources stay in shader-resource state until present.
 inline void TagFrameInputs(
     reshade::api::command_list* cmd_list,
     reshade::api::resource motion_vectors,
     reshade::api::resource depth,
     uint32_t width,
-    uint32_t height) {
+    uint32_t height,
+    float jitter_x,
+    float jitter_y) {
   auto* token = frame_token.load();
   if (!IsActive() || token == nullptr) return;
   constexpr uint32_t SHADER_RESOURCE_STATE = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -399,6 +449,8 @@ inline void TagFrameInputs(
   }
   tagged_width = width;
   tagged_height = height;
+  // Common constants must be set before any evaluate (DLAA) and before present (DLSS-G).
+  SetCommonConstants(token, jitter_x, jitter_y);
   inputs_tagged = true;
   if (tag_log_count.fetch_add(1u) < 3u) {
     renodx::utils::log::i("streamline: tagged inputs for frame ", static_cast<uint32_t>(*token), " on thread ", GetCurrentThreadId());
@@ -433,47 +485,65 @@ inline void TagUiInputs(
   ui_tagged = true;
 }
 
-inline sl::float4x4 IdentityMatrix() {
-  sl::float4x4 matrix = {};
-  matrix.setRow(0u, {1.f, 0.f, 0.f, 0.f});
-  matrix.setRow(1u, {0.f, 1.f, 0.f, 0.f});
-  matrix.setRow(2u, {0.f, 0.f, 1.f, 0.f});
-  matrix.setRow(3u, {0.f, 0.f, 0.f, 1.f});
-  return matrix;
-}
+inline std::atomic<uint32_t> dlaa_error_log_count = 0u;
+inline uint32_t dlaa_options_width = 0u;
+inline uint32_t dlaa_options_height = 0u;
 
-// G1: camera matrices are not read back yet; motion vectors are dense (camera + objects), so only their
-// conventions matter. FH2 uses standard depth (0 near, 1 far), per its depth linearization in 0x34ADA64E.
-inline void SetCommonConstants(sl::FrameToken* token) {
-  sl::Constants constants = {};
-  constants.cameraViewToClip = IdentityMatrix();
-  constants.clipToCameraView = IdentityMatrix();
-  constants.clipToLensClip = IdentityMatrix();
-  constants.clipToPrevClip = IdentityMatrix();
-  constants.prevClipToClip = IdentityMatrix();
-  constants.jitterOffset = {0.f, 0.f};
-  constants.mvecScale = {1.f, 1.f};
-  constants.cameraPinholeOffset = {0.f, 0.f};
-  constants.cameraPos = {0.f, 0.f, 0.f};
-  constants.cameraUp = {0.f, 1.f, 0.f};
-  constants.cameraRight = {1.f, 0.f, 0.f};
-  constants.cameraFwd = {0.f, 0.f, 1.f};
-  constants.cameraNear = 0.1f;
-  constants.cameraFar = 10000.f;
-  constants.cameraFOV = 1.0472f;
-  constants.cameraAspectRatio = (tagged_height != 0u ? static_cast<float>(tagged_width) / static_cast<float>(tagged_height) : 16.f / 9.f);
-  constants.motionVectorsInvalidValue = 0.f;
-  constants.depthInverted = sl::Boolean::eFalse;
-  constants.cameraMotionIncluded = sl::Boolean::eTrue;
-  constants.motionVectors3D = sl::Boolean::eFalse;
-  constants.reset = sl::Boolean::eFalse;
-  constants.orthographicProjection = sl::Boolean::eFalse;
-  constants.motionVectorsDilated = sl::Boolean::eFalse;
-  constants.motionVectorsJittered = sl::Boolean::eFalse;
-  if (const auto result = api.set_constants(constants, *token, VIEWPORT);
-      result != sl::Result::eOk && constants_error_log_count.fetch_add(1u) < 3u) {
-    renodx::utils::log::e("streamline: slSetConstants failed (", static_cast<uint32_t>(result), ").");
+// DLSS Super Resolution at 1.0x (DLAA) on the jittered scene colour. Needs this frame's inputs tagged first
+// (depth, motion vectors, common constants with the jitter). The caller restores command list state afterwards.
+inline bool EvaluateDlaa(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource input,
+    uint32_t input_state,
+    reshade::api::resource output,
+    uint32_t output_state,
+    uint32_t width,
+    uint32_t height) {
+  auto* token = frame_token.load();
+  if (!IsActive() || token == nullptr || !inputs_tagged || api.dlss_set_options == nullptr || api.evaluate_feature == nullptr) return false;
+  const auto log_error = [](const char* call, sl::Result result) {
+    if (dlaa_error_log_count.fetch_add(1u) < 3u) {
+      renodx::utils::log::e("streamline: ", call, " failed (", static_cast<uint32_t>(result), ").");
+    }
+  };
+
+  if (dlaa_options_width != width || dlaa_options_height != height) {
+    sl::DLSSOptions options = {};
+    options.mode = sl::DLSSMode::eDLAA;
+    options.outputWidth = width;
+    options.outputHeight = height;
+    options.colorBuffersHDR = sl::Boolean::eTrue;
+    // The scene colour is pre-exposure linear HDR; FH2 applies its adaptive exposure in the tonemap.
+    options.useAutoExposure = sl::Boolean::eTrue;
+    if (const auto result = api.dlss_set_options(VIEWPORT, options); result != sl::Result::eOk) {
+      log_error("slDLSSSetOptions", result);
+      return false;
+    }
+    dlaa_options_width = width;
+    dlaa_options_height = height;
+    renodx::utils::log::i("streamline: DLAA enabled at ", width, "x", height, ".");
   }
+
+  sl::Resource input_resource = {sl::ResourceType::eTex2d, reinterpret_cast<void*>(input.handle), input_state};
+  sl::Resource output_resource = {sl::ResourceType::eTex2d, reinterpret_cast<void*>(output.handle), output_state};
+  const sl::Extent extent = {.top = 0u, .left = 0u, .width = width, .height = height};
+  const sl::ResourceTag tags[] = {
+      {&input_resource, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &extent},
+      {&output_resource, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &extent},
+  };
+  auto* command_buffer = reinterpret_cast<sl::CommandBuffer*>(cmd_list->get_native());
+  if (const auto result = api.set_tag_for_frame(*token, VIEWPORT, tags, static_cast<uint32_t>(std::size(tags)), command_buffer);
+      result != sl::Result::eOk) {
+    log_error("slSetTagForFrame(DLAA)", result);
+    return false;
+  }
+  const sl::BaseStructure* inputs[] = {&VIEWPORT};
+  if (const auto result = api.evaluate_feature(sl::kFeatureDLSS, *token, inputs, static_cast<uint32_t>(std::size(inputs)), command_buffer);
+      result != sl::Result::eOk) {
+    log_error("slEvaluateFeature(DLSS)", result);
+    return false;
+  }
+  return true;
 }
 
 inline void LogFrameGenerationState(const sl::DLSSGOptions& options) {
@@ -563,9 +633,6 @@ inline void OnPresent(
     // DLSS-G requires Reflex; "Off" only applies while frame generation is off.
     if (mode.frame_generation && mode.reflex == sl::ReflexMode::eOff) {
       mode.reflex = sl::ReflexMode::eLowLatency;
-    }
-    if (mode.frame_generation) {
-      SetCommonConstants(token);
     }
     if (!applied_mode_valid || !(mode == applied_mode)) {
       ApplyOutputMode(mode);

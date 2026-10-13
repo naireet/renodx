@@ -22,6 +22,10 @@ namespace forzahorizon2::jitter {
 
 // Off / On (test: jitter without DLAA visibly shimmers).
 inline float jitter_setting = 0.f;
+// DLAA (DLSS SR at 1.0x) needs the jitter, so it enables it too.
+inline float dlaa_setting = 0.f;
+// Sign of the jitter reported to DLSS: bit 0 flips X, bit 1 flips Y (tuning aid until the convention is confirmed).
+inline float jitter_sign_setting = 0.f;
 inline constexpr uint32_t PHASE_COUNT = 16u;
 
 inline uint32_t swap_chain_width = 0u;
@@ -58,7 +62,7 @@ inline std::array<float, 2> CurrentOffset() {
 }
 
 inline bool IsEnabled() {
-  return jitter_setting != 0.f && swap_chain_width != 0u;
+  return (jitter_setting != 0.f || dlaa_setting != 0.f) && swap_chain_width != 0u;
 }
 
 // D3D12 replaces the whole viewport array, so every viewport the game bound is rebound.
