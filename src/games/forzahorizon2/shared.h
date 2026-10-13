@@ -31,10 +31,15 @@ struct ShaderInjectData {
   float swap_chain_output_preset;
   float tone_map_cone_contrast;
   float psychov_gamut_compression;
+
+  float frame_generation_ui_mask;
+  float padding0;
+  float padding1;
+  float padding2;
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(ShaderInjectData) == 4u * 16u);
+static_assert(sizeof(ShaderInjectData) == 4u * 20u);
 // Azimuth's graphics root signature already uses all 64 root DWORDs, so game-pass replacements read the
 // settings from this existing pixel root CBV (bound only around the replaced draw), not an injected one.
 static constexpr uint32_t FH2_SETTINGS_ROOT_CBV_REGISTER = 10u;
@@ -63,6 +68,8 @@ cbuffer injected_buffer : register(b13, space50) {
 #define RENODX_TONE_MAP_WORKING_COLOR_SPACE  shader_injection.tone_map_working_color_space
 #define RENODX_TONE_MAP_CONE_CONTRAST        shader_injection.tone_map_cone_contrast
 #define RENODX_PSYCHOV_GAMUT_COMPRESSION     shader_injection.psychov_gamut_compression
+// DLSS-G UI alpha: 0 exact HUD coverage, 1 solid (any coverage counts as UI).
+#define CUSTOM_FRAME_GENERATION_UI_MASK      shader_injection.frame_generation_ui_mask
 #define RENODX_COLOR_GRADE_STRENGTH          shader_injection.color_grade_strength
 // SDR output re-encodes sRGB like vanilla, so 2.2 emulation only applies in HDR.
 #define RENODX_GAMMA_CORRECTION              (shader_injection.swap_chain_output_preset == 0.f ? 0.f : shader_injection.gamma_correction)
