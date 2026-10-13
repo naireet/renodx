@@ -96,7 +96,11 @@ inline float frame_generation_setting = 1.f;
 inline std::atomic_bool inputs_tagged = false;
 inline bool frame_generation_on = false;
 inline uint32_t tagged_width = 0u;
-inline uint32_t tagged_height = 0u; std::atomic<uint32_t> tag_log_count = 0u; std::atomic<uint32_t> present_log_count = 0u;
+inline uint32_t tagged_height = 0u;
+inline std::atomic<uint32_t> tag_log_count = 0u;
+inline std::atomic<uint32_t> present_log_count = 0u;
+inline std::atomic<uint32_t> tag_error_log_count = 0u;
+inline std::atomic<uint32_t> constants_error_log_count = 0u;
 inline std::atomic_bool swap_chain_created = false;
 // Streamline's proxies call back into the native objects whose vtable slots are redirected here.
 inline thread_local bool in_streamline_call = false;
@@ -236,7 +240,8 @@ inline bool OnCreateDevice(reshade::api::device_api device_api, uint32_t& /*api_
   // No OTA: Azimuth is firewalled and only the vetted local runtime may load.
   preferences.flags = sl::PreferenceFlags::eDisableCLStateTracking
                       | sl::PreferenceFlags::eUseManualHooking
-                      | sl::PreferenceFlags::eUseDXGIFactoryProxy;
+                      | sl::PreferenceFlags::eUseDXGIFactoryProxy
+                      | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
   preferences.featuresToLoad = features;
   preferences.numFeaturesToLoad = static_cast<uint32_t>(std::size(features));
   preferences.engine = sl::EngineType::eCustom;
@@ -369,7 +374,9 @@ inline void TagFrameInputs(
   const auto result = api.set_tag_for_frame(
       *token, VIEWPORT, tags, static_cast<uint32_t>(std::size(tags)), reinterpret_cast<sl::CommandBuffer*>(cmd_list->get_native()));
   if (result != sl::Result::eOk) {
-    renodx::utils::log::e("streamline: slSetTagForFrame failed (", static_cast<uint32_t>(result), ").");
+    if (tag_error_log_count.fetch_add(1u) < 3u) {
+      renodx::utils::log::e("streamline: slSetTagForFrame failed (", static_cast<uint32_t>(result), ").");
+    }
     return;
   }
   tagged_width = width;
@@ -417,7 +424,8 @@ inline void SetCommonConstants(sl::FrameToken* token) {
   constants.orthographicProjection = sl::Boolean::eFalse;
   constants.motionVectorsDilated = sl::Boolean::eFalse;
   constants.motionVectorsJittered = sl::Boolean::eFalse;
-  if (const auto result = api.set_constants(constants, *token, VIEWPORT); result != sl::Result::eOk) {
+  if (const auto result = api.set_constants(constants, *token, VIEWPORT);
+      result != sl::Result::eOk && constants_error_log_count.fetch_add(1u) < 3u) {
     renodx::utils::log::e("streamline: slSetConstants failed (", static_cast<uint32_t>(result), ").");
   }
 }
