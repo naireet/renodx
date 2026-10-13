@@ -35,7 +35,7 @@ float HableInverse(float y, HableParams params) {
   return max(max(root_a, root_b), 0.f);
 }
 
-// Neutwo keeps vanilla output up to this level exactly; above it each channel continues along the tangent.
+// Neutwo keeps vanilla output up to this level exactly; above it each channel extends per channel.
 static const float HABLE_EXTENSION_PIVOT = 0.5f;
 static const float MID_GRAY = 0.18f;
 
@@ -105,11 +105,16 @@ float3 ApplyFH2ToneMap(float3 untonemapped, float3 vanilla_tonemapped, float3 gr
   if (is_hdr && hable_enabled) {
     float hable_white = (1.f - params.e_over_f) * params.white_scale;
     float pivot_out = min(HABLE_EXTENSION_PIVOT, 0.8f * hable_white);
-    float pivot_in = HableInverse(pivot_out, params);
+    float pivot_in = max(HableInverse(pivot_out, params), 1e-4f);
     float pivot_slope = HableDerivative(pivot_in, params);
-    float3 tangent = pivot_out + pivot_slope * (untonemapped - pivot_in);
+    // C1 at the pivot, then the slope rises toward the scene-linear exposure that maps scene to vanilla mid gray,
+    // so highlights scale like the scene instead of the flat Hable shoulder tangent.
+    float scene_slope = max(MID_GRAY / max(HableInverse(MID_GRAY, params), 1e-6f), pivot_slope);
+    float3 distance = max(0.f, untonemapped - pivot_in);
+    float3 extension = pivot_out + scene_slope * distance
+                       - (scene_slope - pivot_slope) * pivot_in * log(1.f + distance / pivot_in);
     bool3 above_pivot = untonemapped > pivot_in;
-    extended = above_pivot ? tangent : vanilla_tonemapped;
+    extended = above_pivot ? extension : vanilla_tonemapped;
     // Carry the LUT/vignette/matrix grade into the extension; below the pivot the result is exactly vanilla.
     grade_ratio = above_pivot ? extended / max(vanilla_tonemapped, 1e-6f) : 1.f;
   }

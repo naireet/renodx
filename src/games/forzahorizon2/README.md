@@ -11,6 +11,6 @@ HDR10 output for the Xbox One version of Forza Horizon 2 running through Azimuth
 - Settings `ToneMapPeakNits`, `ToneMapGameNits`, `ToneMapUINits` follow standard RenoDX names.
 - Tone mappers:
   - **Vanilla**: the game's Hable curve, SDR range.
-  - **Neutwo** (default): vanilla output exactly up to 50%, then a per-channel tangent extension of the Hable curve, carrying the LUT/vignette/color-matrix grade. Peak compression uses `ToneMapWorkingColorSpace` (BT.709 max channel by default, or per channel in BT.709/AP1/LMS).
+  - **Neutwo** (default): vanilla output exactly up to 50%, then a per-channel extension that starts on the Hable tangent and rises toward the scene-linear mid-gray exposure, carrying the LUT/vignette/color-matrix grade. Peak compression uses `ToneMapWorkingColorSpace` (BT.709 max channel by default, or per channel in BT.709/AP1/LMS).
   - **PsychoV-17**: exposure and cone response matched to the vanilla curve at output 18%, with the game's grade carried over through `UpgradeToneMap`.
 - Azimuth's 1025-entry output curve is applied in both SDR and HDR (linear continuation above 1.0).
