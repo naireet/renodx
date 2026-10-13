@@ -361,29 +361,22 @@ reshade::api::resource ResolveUpgradedResource(reshade::api::resource resource) 
 // Owned targets live in shader-resource state between passes; the DLAA output stays in unordered-access state.
 constexpr uint32_t D3D12_SHADER_RESOURCE_STATE = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-// Streamline binds its own descriptor heaps on the native list during evaluate, behind ReShade's heap tracking,
-// so Azimuth's shader-visible heaps are set back natively before the tracked state is reapplied.
+// Streamline (manual hooking, no command-list state tracking) sets its own descriptor heaps and compute root
+// signature on the native list during evaluate, behind ReShade's caches. Binding zero tables makes ReShade
+// re-issue SetDescriptorHeaps with Azimuth's last heaps and the root signature; the snapshot then replays the
+// root arguments, tables and pipelines.
 void RestoreAfterStreamlineEvaluate(reshade::api::command_list* cmd_list, const renodx::utils::state::CommandListSnapshot& snapshot) {
-  auto* device = cmd_list->get_device();
-  std::array<ID3D12DescriptorHeap*, 2> heaps = {};
-  uint32_t heap_count = 0u;
-  if (const auto tables = renodx::utils::state::CopyBoundDescriptorTables(cmd_list, renodx::utils::state::PipelineBindPoint::GRAPHICS); tables.has_value()) {
-    for (const auto& [index, table] : tables->tables.entries()) {
-      if (table.handle == 0u) continue;
-      reshade::api::descriptor_heap heap = {0u};
-      device->get_descriptor_heap_offset(table, 0u, 0u, &heap, nullptr);
-      auto* native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
-      if (native_heap == nullptr || std::find(heaps.begin(), heaps.begin() + heap_count, native_heap) != heaps.begin() + heap_count) continue;
-      if (heap_count == heaps.size()) break;
-      heaps[heap_count++] = native_heap;
-    }
+  using renodx::utils::state::PipelineBindPoint;
+  const auto compute = renodx::utils::state::CopyBoundDescriptorTables(cmd_list, PipelineBindPoint::COMPUTE);
+  const auto graphics = renodx::utils::state::CopyBoundDescriptorTables(cmd_list, PipelineBindPoint::GRAPHICS);
+  if (compute.has_value() && compute->layout.handle != 0u) {
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, compute->layout, 0u, 0u, nullptr);
   }
-  if (heap_count != 0u) {
-    reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())->SetDescriptorHeaps(heap_count, heaps.data());
+  if (graphics.has_value() && graphics->layout.handle != 0u) {
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_graphics, graphics->layout, 0u, 0u, nullptr);
   }
   snapshot.Apply();
 }
-
 // Before the tonemap draw (its bindings are set): DLSS inputs for frame generation and DLAA, then DLAA itself.
 void RecordDlssInputs(reshade::api::command_list* cmd_list) {
   if (!forzahorizon2::streamline::IsActive()) return;
@@ -488,6 +481,7 @@ void RecordDlssInputs(reshade::api::command_list* cmd_list) {
       cmd_list, inputs.scene_color, D3D12_SHADER_RESOURCE_STATE, inputs.dlaa_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, width, height);
   RestoreAfterStreamlineEvaluate(cmd_list, snapshot.value());
   if (!evaluated) return;
+  forzahorizon2::jitter::dlaa_evaluated_this_frame = true;
 
   const reshade::api::resource copy_resources[2] = {inputs.dlaa_output, inputs.scene_color};
   const reshade::api::resource_usage copy_before[2] = {reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource};

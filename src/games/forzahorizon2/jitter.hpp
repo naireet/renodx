@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <shared_mutex>
@@ -26,6 +27,9 @@ inline float jitter_setting = 0.f;
 inline float dlaa_setting = 0.f;
 // Sign of the jitter reported to DLSS: bit 0 flips X, bit 1 flips Y (tuning aid until the convention is confirmed).
 inline float jitter_sign_setting = 0.f;
+// DLAA only jitters while DLSS actually resolves it: set by a successful evaluate, latched per frame at present.
+inline std::atomic_bool dlaa_evaluated_this_frame = false;
+inline std::atomic_bool dlaa_active = false;
 inline constexpr uint32_t PHASE_COUNT = 16u;
 
 inline uint32_t swap_chain_width = 0u;
@@ -62,7 +66,7 @@ inline std::array<float, 2> CurrentOffset() {
 }
 
 inline bool IsEnabled() {
-  return (jitter_setting != 0.f || dlaa_setting != 0.f) && swap_chain_width != 0u;
+  return (jitter_setting != 0.f || (dlaa_setting != 0.f && dlaa_active)) && swap_chain_width != 0u;
 }
 
 // D3D12 replaces the whole viewport array, so every viewport the game bound is rebound.
@@ -151,6 +155,7 @@ inline void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/)
 
 inline void OnPresent() {
   ++frame_index;
+  dlaa_active = dlaa_evaluated_this_frame.exchange(false);
 }
 
 }  // namespace forzahorizon2::jitter
