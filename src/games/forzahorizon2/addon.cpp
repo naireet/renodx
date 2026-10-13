@@ -261,6 +261,17 @@ bool OnDraw(reshade::api::command_list* cmd_list, uint32_t vertex_count, uint32_
   return false;
 }
 
+// Any other draw type invalidates the recorded arguments, so a re-issue never replays the wrong geometry.
+bool OnDrawIndexed(reshade::api::command_list* /*cmd_list*/, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+  last_draw = {};
+  return false;
+}
+
+bool OnDrawOrDispatchIndirect(reshade::api::command_list* /*cmd_list*/, reshade::api::indirect_command, reshade::api::resource, uint64_t, uint32_t, uint32_t) {
+  last_draw = {};
+  return false;
+}
+
 // Replaced targets and their PSOs may still be referenced by in-flight frames (and Streamline at present), so
 // they are destroyed only after enough presents for the GPU to have finished with them.
 struct RetiredFrameGenerationInputs {
@@ -973,6 +984,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       // Before mods::shader, so draws are recorded before it replays them for on_drawn callbacks.
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
+      reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       // Module events first so their per-device data exists when this addon's init_device runs.
       renodx::utils::resource::upgrade::Use(fdw_reason);
       renodx::utils::swapchain::Use(fdw_reason);
@@ -1003,6 +1016,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       forzahorizon2::streamline::Uninstall();
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
+      reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
