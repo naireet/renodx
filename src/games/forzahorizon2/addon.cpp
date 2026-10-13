@@ -278,6 +278,9 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 
 renodx::utils::settings::Setting* output_mode_setting = nullptr;
 renodx::utils::settings::Setting* tone_map_peak_nits_setting = nullptr;
+constexpr float FALLBACK_PEAK_NITS = 1000.f;
+float peak_nits_default = FALLBACK_PEAK_NITS;
+bool peak_nits_default_initialized = false;
 renodx::utils::settings::Setting* tone_map_game_nits_setting = nullptr;
 renodx::utils::settings::Setting* tone_map_ui_nits_setting = nullptr;
 
@@ -347,11 +350,10 @@ renodx::utils::settings::Settings settings = {
     tone_map_peak_nits_setting = new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",
         .binding = &shader_injection.peak_white_nits,
-        .default_value = 1000.f,
-        .can_reset = false,
+        .default_value = FALLBACK_PEAK_NITS,
         .label = "Peak Brightness",
         .section = "Output",
-        .tooltip = "Sets the display peak white in nits.",
+        .tooltip = "Sets the display peak white in nits. Resets to the display's reported peak.",
         .min = 48.f,
         .max = 4000.f,
         .is_enabled = &IsHDREnabled,
@@ -410,12 +412,12 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapWorkingColorSpace",
         .binding = &shader_injection.tone_map_working_color_space,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
+        .default_value = 3.f,
         .label = "Working Color Space",
         .section = "Tone Mapping",
         .tooltip = "Space for the Neutwo peak compression."
-                   "\nBT.709 (Max Channel) preserves the SDR grade's hue and saturation."
-                   "\nPer-channel spaces roll highlights toward white.",
+                   "\nLMS (default) compresses per cone response."
+                   "\nBT.709 (Max Channel) compresses all channels together, preserving RGB ratios.",
         .labels = {"BT.709 (Max Channel)", "BT.709", "AP1", "LMS"},
         .is_enabled = &IsNeutwoEnabled,
     },
@@ -525,11 +527,11 @@ renodx::utils::settings::Settings settings = {
 void OnPresetOff() {
   renodx::utils::settings::UpdateSettings({
       {"ToneMapType", 0.f},
-      {"ToneMapPeakNits", 1000.f},
+      {"ToneMapPeakNits", peak_nits_default},
       {"ToneMapGameNits", 203.f},
       {"ToneMapUINits", 203.f},
       {"GammaCorrection", 0.f},
-      {"ToneMapWorkingColorSpace", 0.f},
+      {"ToneMapWorkingColorSpace", 3.f},
       {"ColorGradeExposure", 1.f},
       {"ColorGradeHighlights", 50.f},
       {"ColorGradeShadows", 50.f},
@@ -541,6 +543,16 @@ void OnPresetOff() {
       {"ColorGradeScene", 100.f},
   });
   SyncSwapChainOutputPreset();
+}
+
+void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
+  if (peak_nits_default_initialized) return;
+  peak_nits_default_initialized = true;
+  peak_nits_default = roundf(renodx::utils::swapchain::GetPeakNits(swapchain).value_or(FALLBACK_PEAK_NITS));
+
+  const bool was_using_default = tone_map_peak_nits_setting->GetValue() == tone_map_peak_nits_setting->default_value;
+  tone_map_peak_nits_setting->default_value = peak_nits_default;
+  if (was_using_default) tone_map_peak_nits_setting->Set(peak_nits_default)->Write();
 }
 
 void OnPresent(
@@ -596,6 +608,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
       SyncSwapChainOutputPreset();
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
@@ -605,6 +618,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
