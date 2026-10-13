@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 
@@ -18,6 +20,8 @@
 #include "../../utils/bitwise.hpp"
 #include "../../utils/data.hpp"
 #include "../../utils/pipeline_layout.hpp"
+#include "../../utils/render.hpp"
+#include "../../utils/resource.hpp"
 #include "../../utils/resource_upgrade.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
@@ -207,6 +211,100 @@ void OnDestroyPipelineLayout(reshade::api::device* /*device*/, reshade::api::pip
   settings_param_by_layout.erase(layout.handle);
 }
 
+// DLSS inputs (frame generation, later DLAA): full-resolution unclamped motion vectors and a depth copy, drawn
+// right after the tonemap draw on Azimuth's root signature so that draw's depth, stencil, cb1 and cb13 bindings
+// are reused as-is. Owned targets keep Streamline's state tracking independent of Azimuth's enhanced barriers.
+struct FrameGenerationInputs {
+  std::mutex mutex;
+  reshade::api::resource motion_vectors = {0u};
+  reshade::api::resource depth = {0u};
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+  uint64_t layout = 0u;
+  renodx::utils::render::RenderPass pass;
+  bool failure_logged = false;
+};
+FrameGenerationInputs frame_generation_inputs;
+
+void DestroyFrameGenerationInputs(reshade::api::device* device) {
+  frame_generation_inputs.pass.DestroyAll(device);
+  frame_generation_inputs.pass = {};
+  for (auto* resource : {&frame_generation_inputs.motion_vectors, &frame_generation_inputs.depth}) {
+    if (resource->handle != 0u) {
+      device->destroy_resource(*resource);
+      *resource = {0u};
+    }
+  }
+  frame_generation_inputs.width = 0u;
+  frame_generation_inputs.height = 0u;
+  frame_generation_inputs.layout = 0u;
+}
+
+void RecordFrameGenerationInputs(reshade::api::command_list* cmd_list) {
+  if (!forzahorizon2::streamline::IsActive()) return;
+
+  reshade::api::pipeline_layout layout = {0u};
+  settings_root_cbvs.if_contains(cmd_list, [&](const auto& pair) { layout = pair.second.layout; });
+  const auto target_view = renodx::utils::state::GetRenderTarget(cmd_list, 0u);
+  if (layout.handle == 0u || target_view.handle == 0u) return;
+
+  auto* device = cmd_list->get_device();
+  const auto target_desc = device->get_resource_desc(device->get_resource_from_view(target_view));
+  const uint32_t width = target_desc.texture.width;
+  const uint32_t height = target_desc.texture.height;
+
+  const std::unique_lock lock(frame_generation_inputs.mutex);
+  auto& inputs = frame_generation_inputs;
+  if (inputs.width != width || inputs.height != height || inputs.layout != layout.handle) {
+    DestroyFrameGenerationInputs(device);
+    constexpr auto USAGE = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
+    const bool created =
+        device->create_resource(
+            reshade::api::resource_desc(width, height, 1u, 1u, reshade::api::format::r16g16_float, 1u, reshade::api::memory_heap::gpu_only, USAGE),
+            nullptr, reshade::api::resource_usage::shader_resource, &inputs.motion_vectors)
+        && device->create_resource(
+            reshade::api::resource_desc(width, height, 1u, 1u, reshade::api::format::r32_float, 1u, reshade::api::memory_heap::gpu_only, USAGE),
+            nullptr, reshade::api::resource_usage::shader_resource, &inputs.depth);
+    if (!created) {
+      if (!inputs.failure_logged) {
+        inputs.failure_logged = true;
+        reshade::log::message(reshade::log::level::error, "forzahorizon2: failed to create DLSS input targets.");
+      }
+      DestroyFrameGenerationInputs(device);
+      return;
+    }
+    inputs.width = width;
+    inputs.height = height;
+    inputs.layout = layout.handle;
+    inputs.pass.layout = layout;
+    inputs.pass.use_render_pass = false;
+    inputs.pass.revert_state_after_render = true;
+    inputs.pass.pipeline_subobjects.vertex_shader = __fullscreen_triangle;
+    inputs.pass.pipeline_subobjects.pixel_shader = __motion_vectors;
+    inputs.pass.render_target_slots.resources = {inputs.motion_vectors, inputs.depth};
+    inputs.pass.render_target_slots.view_descs = {
+        reshade::api::resource_view_desc(reshade::api::format::r16g16_float),
+        reshade::api::resource_view_desc(reshade::api::format::r32_float),
+    };
+    reshade::log::message(reshade::log::level::info, "forzahorizon2: created DLSS input targets.");
+  }
+
+  const reshade::api::resource targets[2] = {inputs.motion_vectors, inputs.depth};
+  const reshade::api::resource_usage readable[2] = {reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::shader_resource};
+  const reshade::api::resource_usage writable[2] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::render_target};
+  cmd_list->barrier(2u, targets, readable, writable);
+  const bool rendered = inputs.pass.Render(cmd_list);
+  cmd_list->barrier(2u, targets, writable, readable);
+  if (!rendered) {
+    if (!inputs.failure_logged) {
+      inputs.failure_logged = true;
+      reshade::log::message(reshade::log::level::error, "forzahorizon2: DLSS input pass failed.");
+    }
+    return;
+  }
+  forzahorizon2::streamline::TagFrameInputs(cmd_list, inputs.motion_vectors, inputs.depth, width, height);
+}
+
 void OnInitDevice(reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d12) return;
   if (!upgrade_infos_applied) {
@@ -235,6 +333,10 @@ void OnInitDevice(reshade::api::device* device) {
 }
 
 void OnDestroyDevice(reshade::api::device* device) {
+  {
+    const std::unique_lock lock(frame_generation_inputs.mutex);
+    DestroyFrameGenerationInputs(device);
+  }
   if (settings_buffer.handle == 0u) return;
   device->unmap_buffer_region(settings_buffer);
   device->destroy_resource(settings_buffer);
@@ -266,7 +368,10 @@ renodx::mods::shader::CustomShaders custom_shaders = {
          .on_replace = &BindSettingsRootCbv,
          // Its layout is Azimuth's full root signature; settings come from the borrowed root CBV instead.
          .on_inject = [](reshade::api::command_list*) { return false; },
-         .on_drawn = &RestoreSettingsRootCbv,
+         .on_drawn = [](reshade::api::command_list* cmd_list) {
+           RecordFrameGenerationInputs(cmd_list);
+           RestoreSettingsRootCbv(cmd_list);
+         },
      }},
     // Azimuth display plane -> swapchain composite; replaced as the SDR/HDR10 output pass
     {0x3F8871B6,
@@ -525,6 +630,18 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "FrameGeneration",
+        .binding = &forzahorizon2::streamline::frame_generation_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "DLSS Frame Generation",
+        .section = "Frame Generation",
+        .tooltip = "Experimental. Requires NVIDIA's Streamline runtime in the renodx-streamline folder next to azimuth.exe.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
+        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+    },
+    new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
         .label = "Recommended",
         .section = "Options",
@@ -627,6 +744,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           return params.size() <= 3u;
         };
         renodx::utils::resource::upgrade::use_resource_cloning_dx12_only = true;
+        // DLSS input passes restore Azimuth's command list state from tracked snapshots; only pay for that
+        // tracking when the Streamline runtime is installed.
+        std::array<wchar_t, MAX_PATH> executable_path = {};
+        GetModuleFileNameW(nullptr, executable_path.data(), static_cast<DWORD>(executable_path.size()));
+        renodx::utils::state::use_snapshot = std::filesystem::exists(
+            std::filesystem::path(executable_path.data()).parent_path() / forzahorizon2::streamline::PLUGIN_FOLDER_NAME / L"sl.interposer.dll");
         initialized = true;
       }
 

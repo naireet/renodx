@@ -69,6 +69,8 @@ struct Api {
   PFun_slIsFeatureSupported* is_feature_supported = nullptr;
   PFun_slGetFeatureFunction* get_feature_function = nullptr;
   PFun_slGetNewFrameToken* get_new_frame_token = nullptr;
+  PFun_slSetTagForFrame* set_tag_for_frame = nullptr;
+  PFun_slSetConstants* set_constants = nullptr;
   PFun_slDLSSGSetOptions* dlssg_set_options = nullptr;
   PFun_slDLSSGGetState* dlssg_get_state = nullptr;
   PFun_slReflexSetOptions* reflex_set_options = nullptr;
@@ -88,7 +90,13 @@ inline IDXGIFactory2* proxy_factory = nullptr;
 // ReShade's queue wrapper forwards the native queue.
 inline renodx::utils::data::ParallelFlatHashMap<IUnknown*, IUnknown*, std::shared_mutex> proxy_queue_by_native_queue;
 inline uint32_t frame_index = 0u;
-inline sl::FrameToken* frame_token = nullptr;
+inline std::atomic<sl::FrameToken*> frame_token = nullptr;
+// User toggle (settings); frame generation also requires inputs tagged during the frame being presented.
+inline float frame_generation_setting = 1.f;
+inline std::atomic_bool inputs_tagged = false;
+inline bool frame_generation_on = false;
+inline uint32_t tagged_width = 0u;
+inline uint32_t tagged_height = 0u;
 inline std::atomic_bool swap_chain_created = false;
 // Streamline's proxies call back into the native objects whose vtable slots are redirected here.
 inline thread_local bool in_streamline_call = false;
@@ -207,8 +215,11 @@ inline bool OnCreateDevice(reshade::api::device_api device_api, uint32_t& /*api_
   api.is_feature_supported = reinterpret_cast<PFun_slIsFeatureSupported*>(GetProcAddress(interposer, "slIsFeatureSupported"));
   api.get_feature_function = reinterpret_cast<PFun_slGetFeatureFunction*>(GetProcAddress(interposer, "slGetFeatureFunction"));
   api.get_new_frame_token = reinterpret_cast<PFun_slGetNewFrameToken*>(GetProcAddress(interposer, "slGetNewFrameToken"));
+  api.set_tag_for_frame = reinterpret_cast<PFun_slSetTagForFrame*>(GetProcAddress(interposer, "slSetTagForFrame"));
+  api.set_constants = reinterpret_cast<PFun_slSetConstants*>(GetProcAddress(interposer, "slSetConstants"));
   if (api.init == nullptr || api.set_d3d_device == nullptr || api.upgrade_interface == nullptr || api.get_native_interface == nullptr
-      || api.is_feature_supported == nullptr || api.get_feature_function == nullptr || api.get_new_frame_token == nullptr) {
+      || api.is_feature_supported == nullptr || api.get_feature_function == nullptr || api.get_new_frame_token == nullptr
+      || api.set_tag_for_frame == nullptr || api.set_constants == nullptr) {
     renodx::utils::log::e("streamline: sl.interposer.dll is missing core exports.");
     return false;
   }
@@ -309,25 +320,115 @@ inline void OnInitDevice(reshade::api::device* device) {
   }
 }
 
+inline bool IsActive() {
+  return initialized && swap_chain_created;
+}
+
 inline void SetMarker(sl::PCLMarker marker) {
-  if (api.pcl_set_marker != nullptr && frame_token != nullptr) {
-    api.pcl_set_marker(marker, *frame_token);
+  auto* token = frame_token.load();
+  if (api.pcl_set_marker != nullptr && token != nullptr) {
+    api.pcl_set_marker(marker, *token);
   }
 }
 
 // Azimuth has no Reflex integration; markers are synthesized around its present (DLSS-G requires them).
 inline void BeginFrame() {
   ++frame_index;
-  if (api.get_new_frame_token(frame_token, &frame_index) != sl::Result::eOk) {
+  sl::FrameToken* token = nullptr;
+  if (api.get_new_frame_token(token, &frame_index) != sl::Result::eOk) {
     frame_token = nullptr;
     return;
   }
+  frame_token = token;
+  inputs_tagged = false;
   if (api.reflex_sleep != nullptr) {
-    api.reflex_sleep(*frame_token);
+    api.reflex_sleep(*token);
   }
   SetMarker(sl::PCLMarker::eSimulationStart);
   SetMarker(sl::PCLMarker::eSimulationEnd);
   SetMarker(sl::PCLMarker::eRenderSubmitStart);
+}
+
+// Called while recording the frame's tonemap draw. Both resources stay in shader-resource state until present.
+inline void TagFrameInputs(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource motion_vectors,
+    reshade::api::resource depth,
+    uint32_t width,
+    uint32_t height) {
+  auto* token = frame_token.load();
+  if (!IsActive() || token == nullptr) return;
+  constexpr uint32_t SHADER_RESOURCE_STATE = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  sl::Resource motion_vector_resource = {sl::ResourceType::eTex2d, reinterpret_cast<void*>(motion_vectors.handle), SHADER_RESOURCE_STATE};
+  sl::Resource depth_resource = {sl::ResourceType::eTex2d, reinterpret_cast<void*>(depth.handle), SHADER_RESOURCE_STATE};
+  const sl::Extent extent = {.top = 0u, .left = 0u, .width = width, .height = height};
+  const sl::ResourceTag tags[] = {
+      {&depth_resource, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent},
+      {&motion_vector_resource, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent},
+  };
+  const auto result = api.set_tag_for_frame(
+      *token, VIEWPORT, tags, static_cast<uint32_t>(std::size(tags)), reinterpret_cast<sl::CommandBuffer*>(cmd_list->get_native()));
+  if (result != sl::Result::eOk) {
+    renodx::utils::log::e("streamline: slSetTagForFrame failed (", static_cast<uint32_t>(result), ").");
+    return;
+  }
+  tagged_width = width;
+  tagged_height = height;
+  inputs_tagged = true;
+}
+
+inline sl::float4x4 IdentityMatrix() {
+  sl::float4x4 matrix = {};
+  matrix.setRow(0u, {1.f, 0.f, 0.f, 0.f});
+  matrix.setRow(1u, {0.f, 1.f, 0.f, 0.f});
+  matrix.setRow(2u, {0.f, 0.f, 1.f, 0.f});
+  matrix.setRow(3u, {0.f, 0.f, 0.f, 1.f});
+  return matrix;
+}
+
+// G1: camera matrices are not read back yet; motion vectors are dense (camera + objects), so only their
+// conventions matter. FH2 uses standard depth (0 near, 1 far), per its depth linearization in 0x34ADA64E.
+inline void SetCommonConstants(sl::FrameToken* token) {
+  sl::Constants constants = {};
+  constants.cameraViewToClip = IdentityMatrix();
+  constants.clipToCameraView = IdentityMatrix();
+  constants.clipToLensClip = IdentityMatrix();
+  constants.clipToPrevClip = IdentityMatrix();
+  constants.prevClipToClip = IdentityMatrix();
+  constants.jitterOffset = {0.f, 0.f};
+  constants.mvecScale = {1.f, 1.f};
+  constants.cameraPinholeOffset = {0.f, 0.f};
+  constants.cameraPos = {0.f, 0.f, 0.f};
+  constants.cameraUp = {0.f, 1.f, 0.f};
+  constants.cameraRight = {1.f, 0.f, 0.f};
+  constants.cameraFwd = {0.f, 0.f, 1.f};
+  constants.cameraNear = 0.1f;
+  constants.cameraFar = 10000.f;
+  constants.cameraFOV = 1.0472f;
+  constants.cameraAspectRatio = (tagged_height != 0u ? static_cast<float>(tagged_width) / static_cast<float>(tagged_height) : 16.f / 9.f);
+  constants.motionVectorsInvalidValue = 0.f;
+  constants.depthInverted = sl::Boolean::eFalse;
+  constants.cameraMotionIncluded = sl::Boolean::eTrue;
+  constants.motionVectors3D = sl::Boolean::eFalse;
+  constants.reset = sl::Boolean::eFalse;
+  constants.orthographicProjection = sl::Boolean::eFalse;
+  constants.motionVectorsDilated = sl::Boolean::eFalse;
+  constants.motionVectorsJittered = sl::Boolean::eFalse;
+  if (const auto result = api.set_constants(constants, *token, VIEWPORT); result != sl::Result::eOk) {
+    renodx::utils::log::e("streamline: slSetConstants failed (", static_cast<uint32_t>(result), ").");
+  }
+}
+
+inline void LogFrameGenerationState(const sl::DLSSGOptions& options) {
+  sl::DLSSGState state = {};
+  const auto result = api.dlssg_get_state(VIEWPORT, state, &options);
+  renodx::utils::log::i(
+      "streamline: DLSS-G mode ", static_cast<uint32_t>(options.mode),
+      ": state result ", static_cast<uint32_t>(result),
+      ", status ", renodx::utils::log::AsHex(static_cast<uint32_t>(state.status)),
+      ", numFramesToGenerateMax ", state.numFramesToGenerateMax,
+      ", vsyncSupport ", static_cast<uint32_t>(state.bIsVsyncSupportAvailable),
+      ", inputs ", tagged_width, "x", tagged_height);
 }
 
 inline void OnPresent(
@@ -337,27 +438,36 @@ inline void OnPresent(
     const reshade::api::rect* /*dest_rect*/,
     uint32_t /*dirty_rect_count*/,
     const reshade::api::rect* /*dirty_rects*/) {
-  if (!initialized || !swap_chain_created) return;
-  if (frame_token == nullptr) {
+  if (!IsActive()) return;
+  if (frame_token.load() == nullptr) {
     BeginFrame();
   }
+  auto* token = frame_token.load();
 
-  if (!feature_state_logged && api.dlssg_set_options != nullptr && api.dlssg_get_state != nullptr) {
-    feature_state_logged = true;
-    if (api.reflex_set_options != nullptr) {
-      api.reflex_set_options(sl::ReflexOptions{});
+  if (token != nullptr && api.dlssg_set_options != nullptr && api.dlssg_get_state != nullptr) {
+    if (!feature_state_logged) {
+      feature_state_logged = true;
+      LogFrameGenerationState({});
     }
-    // G0: Streamline owns the swapchain but frame generation stays off.
-    const sl::DLSSGOptions options = {};
-    renodx::utils::log::i("streamline: slDLSSGSetOptions(off): ", static_cast<uint32_t>(api.dlssg_set_options(VIEWPORT, options)));
-    sl::DLSSGState state = {};
-    const auto result = api.dlssg_get_state(VIEWPORT, state, &options);
-    renodx::utils::log::i(
-        "streamline: slDLSSGGetState: result ", static_cast<uint32_t>(result),
-        ", status ", renodx::utils::log::AsHex(static_cast<uint32_t>(state.status)),
-        ", minWidthOrHeight ", state.minWidthOrHeight,
-        ", numFramesToGenerateMax ", state.numFramesToGenerateMax,
-        ", vsyncSupport ", static_cast<uint32_t>(state.bIsVsyncSupportAvailable));
+    // Frames without tagged inputs (no 3D scene: loading, video) must not be interpolated.
+    const bool want_frame_generation = frame_generation_setting != 0.f && inputs_tagged;
+    if (want_frame_generation) {
+      SetCommonConstants(token);
+    }
+    if (want_frame_generation != frame_generation_on) {
+      frame_generation_on = want_frame_generation;
+      if (api.reflex_set_options != nullptr) {
+        sl::ReflexOptions reflex_options = {};
+        reflex_options.mode = (want_frame_generation ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff);
+        api.reflex_set_options(reflex_options);
+      }
+      sl::DLSSGOptions options = {};
+      options.mode = (want_frame_generation ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
+      options.numFramesToGenerate = 1u;
+      const auto result = api.dlssg_set_options(VIEWPORT, options);
+      renodx::utils::log::i("streamline: slDLSSGSetOptions(", (want_frame_generation ? "on" : "off"), "): ", static_cast<uint32_t>(result));
+      LogFrameGenerationState(options);
+    }
   }
 
   SetMarker(sl::PCLMarker::eRenderSubmitEnd);
@@ -365,11 +475,10 @@ inline void OnPresent(
 }
 
 inline void OnFinishPresent(reshade::api::command_queue* /*queue*/, reshade::api::swapchain* /*swapchain*/) {
-  if (!initialized || !swap_chain_created || frame_token == nullptr) return;
+  if (!IsActive() || frame_token.load() == nullptr) return;
   SetMarker(sl::PCLMarker::ePresentEnd);
   BeginFrame();
 }
-
 // Streamline itself stays loaded: its proxies own the game's swapchain until process exit.
 inline void Uninstall() {
   try {
