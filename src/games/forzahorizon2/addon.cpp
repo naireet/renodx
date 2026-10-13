@@ -529,7 +529,7 @@ renodx::utils::settings::Settings settings = {
               {"ToneMapWorkingColorSpace", 3.f},
               {"ColorGradeExposure", 1.f},
               {"ColorGradeHighlights", 50.f},
-              {"ColorGradeShadows", 48.f},
+              {"ColorGradeShadows", 52.f},
               {"ColorGradeContrast", 53.f},
               {"ColorGradeSaturation", 55.f},
               {"ColorGradeBlowout", 10.f},
