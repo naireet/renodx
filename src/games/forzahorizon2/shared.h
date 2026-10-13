@@ -38,7 +38,7 @@ static constexpr uint32_t FH2_SETTINGS_ROOT_CBV_REGISTER = 10u;
 #ifdef FH2_SETTINGS_IN_GAME_ROOT_CBV
 cbuffer injected_buffer : register(b10) {  // FH2_SETTINGS_ROOT_CBV_REGISTER
 #else
-// RenoDX-owned passes (swap chain proxy) have their own root signature.
+// The output pass (Azimuth's small composite root signature) gets standard push-constant injection.
 cbuffer injected_buffer : register(b13, space50) {
 #endif
   ShaderInjectData shader_injection : packoffset(c0);

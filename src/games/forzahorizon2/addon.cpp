@@ -15,17 +15,42 @@
 #include <include/reshade.hpp>
 
 #include "../../mods/shader.hpp"
-#include "../../mods/swapchain.hpp"
 #include "../../utils/bitwise.hpp"
 #include "../../utils/data.hpp"
 #include "../../utils/pipeline_layout.hpp"
+#include "../../utils/resource_upgrade.hpp"
 #include "../../utils/settings.hpp"
+#include "../../utils/shader.hpp"
+#include "../../utils/state.hpp"
 #include "../../utils/swapchain.hpp"
 #include "./shared.h"
 
 namespace {
 
 ShaderInjectData shader_injection = {};
+
+// Tonemap target (txFinalTemp, HUD drawn on top) and the display plane copy. Azimuth places game textures over
+// title-memory heaps, so upgrade through committed clones, never in place. Resources with UAV usage are left
+// alone: Azimuth accesses those through integer views that cannot map onto a float clone.
+std::vector<renodx::utils::resource::ResourceUpgradeInfo> upgrade_infos = {
+    {
+        .old_format = reshade::api::format::r10g10b10a2_typeless,
+        .new_format = reshade::api::format::r16g16b16a16_float,
+        .use_resource_view_cloning = true,
+        .aspect_ratio = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER,
+        .usage_include = reshade::api::resource_usage::render_target,
+        .usage_exclude = reshade::api::resource_usage::unordered_access,
+    },
+    {
+        .old_format = reshade::api::format::r10g10b10a2_unorm,
+        .new_format = reshade::api::format::r16g16b16a16_float,
+        .use_resource_view_cloning = true,
+        .aspect_ratio = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER,
+        .usage_include = reshade::api::resource_usage::render_target,
+        .usage_exclude = reshade::api::resource_usage::unordered_access,
+    },
+};
+bool upgrade_infos_applied = false;
 
 // Azimuth's graphics root signature is full (64 DWORDs), so the tonemap replacement reads its settings from
 // the pixel root CBV at FH2_SETTINGS_ROOT_CBV_REGISTER. It is bound right before that draw and rebound to the
@@ -157,7 +182,11 @@ void OnDestroyPipelineLayout(reshade::api::device* /*device*/, reshade::api::pip
 }
 
 void OnInitDevice(reshade::api::device* device) {
-  if (device->get_api() != reshade::api::device_api::d3d12 || settings_buffer.handle != 0u) return;
+  if (device->get_api() != reshade::api::device_api::d3d12) return;
+  if (!upgrade_infos_applied) {
+    upgrade_infos_applied = renodx::utils::resource::upgrade::SetUpgradeInfos(device, upgrade_infos);
+  }
+  if (settings_buffer.handle != 0u) return;
 
   constexpr uint64_t size = SETTINGS_SLOT_SIZE * SETTINGS_SLOT_COUNT;
   if (!device->create_resource(
@@ -187,6 +216,20 @@ void OnDestroyDevice(reshade::api::device* device) {
   settings_buffer_data = nullptr;
 }
 
+
+
+// The replaced Azimuth composite is the HDR10 output pass. HDR output (and the HDR10 color space) is only used
+// once that replacement is confirmed to run, so a missing replacement never shows SDR values as PQ.
+std::atomic<bool> output_pass_replaced = false;
+bool output_pass_active = false;
+
+void OnOutputPassDrawn(reshade::api::command_list* cmd_list) {
+  const auto pipeline = renodx::utils::state::GetBoundShaderPipeline(cmd_list, reshade::api::pipeline_stage::pixel_shader);
+  renodx::utils::shader::WithReplacementPipeline(pipeline, [](auto replacement, auto /*stages*/) {
+    if (replacement.handle != 0u) output_pass_replaced = true;
+  });
+}
+
 // Hashes are Azimuth 0.9.7 runtime translations; re-hash after Azimuth updates.
 renodx::mods::shader::CustomShaders custom_shaders = {
     // FH2 tonemap/composite (bloom, rays, flare, Hable, LUT, vignette)
@@ -195,9 +238,17 @@ renodx::mods::shader::CustomShaders custom_shaders = {
          .crc32 = 0x362A82D8,
          .code = __0x362A82D8,
          .on_replace = &BindSettingsRootCbv,
+         // Its layout is Azimuth's full root signature; settings come from the borrowed root CBV instead.
+         .on_inject = [](reshade::api::command_list*) { return false; },
          .on_drawn = &RestoreSettingsRootCbv,
      }},
-    CustomShaderEntry(0x3F8871B6),  // Azimuth display plane -> swapchain composite (gamma ramp curve)
+    // Azimuth display plane -> swapchain composite; replaced as the SDR/HDR10 output pass
+    {0x3F8871B6,
+     {
+         .crc32 = 0x3F8871B6,
+         .code = __0x3F8871B6,
+         .on_drawn = &OnOutputPassDrawn,
+     }},
 };
 
 renodx::utils::settings::Setting* output_mode_setting = nullptr;
@@ -232,7 +283,7 @@ void SyncSwapChainOutputPreset() {
     next_color_space = color_space;
   };
 
-  if (IsHDREnabled()) {
+  if (IsHDREnabled() && output_pass_active) {
     shader_injection.peak_white_nits = tone_map_peak_nits_setting->GetValue();
     shader_injection.diffuse_white_nits = tone_map_game_nits_setting->GetValue();
     shader_injection.graphics_white_nits = tone_map_ui_nits_setting->GetValue();
@@ -457,6 +508,7 @@ void OnPresent(
     const reshade::api::rect* /*dest_rect*/,
     uint32_t /*dirty_rect_count*/,
     const reshade::api::rect* /*dirty_rects*/) {
+  output_pass_active = output_pass_replaced.exchange(false);
   SyncSwapChainOutputPreset();
   if (swapchain == nullptr || !next_color_space.has_value()) return;
 
@@ -465,7 +517,6 @@ void OnPresent(
   current_color_space = pending_color_space;
   next_color_space = std::nullopt;
 }
-
 bool initialized = false;
 
 }  // namespace
@@ -480,35 +531,25 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
-
-        renodx::mods::swapchain::SetUseHDR10(true);
-        renodx::mods::swapchain::set_color_space = false;
-        renodx::mods::swapchain::expected_constant_buffer_index = 13;
-        renodx::mods::swapchain::expected_constant_buffer_space = 50;
-        renodx::mods::swapchain::use_resource_cloning = true;
-        renodx::mods::swapchain::use_resource_cloning_dx12_only = true;
-        renodx::mods::swapchain::swapchain_proxy_compatibility_mode = false;
-        renodx::mods::swapchain::swap_chain_proxy_vertex_shader = __swap_chain_proxy_vertex_shader;
-        renodx::mods::swapchain::swap_chain_proxy_pixel_shader = __swap_chain_proxy_pixel_shader;
-
-        // Tonemap target (txFinalTemp, HUD drawn on top) and the display plane copy. Azimuth places
-        // game textures over title-memory heaps, so upgrade through committed clones, never in place.
-        renodx::mods::swapchain::resource_upgrade_infos.push_back({
-            .old_format = reshade::api::format::r10g10b10a2_typeless,
-            .new_format = reshade::api::format::r16g16b16a16_typeless,
-            .use_resource_view_cloning = true,
-            .aspect_ratio = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER,
-            .usage_include = reshade::api::resource_usage::render_target,
-        });
-        renodx::mods::swapchain::resource_upgrade_infos.push_back({
-            .old_format = reshade::api::format::r10g10b10a2_unorm,
-            .new_format = reshade::api::format::r16g16b16a16_float,
-            .use_resource_view_cloning = true,
-            .aspect_ratio = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER,
-            .usage_include = reshade::api::resource_usage::render_target,
-        });
+        renodx::mods::shader::expected_constant_buffer_index = 13;
+        renodx::mods::shader::expected_constant_buffer_space = 50;
+        // Azimuth's layouts carry per-stage root constants; push-constant injection skips layouts without
+        // DWORD budget (Azimuth's main graphics root signature), so only small layouts like the output pass get it.
+        renodx::mods::shader::allow_multiple_push_constants = true;
+        renodx::mods::shader::allow_undersized_shader_injection = false;
+        // Only inject into tiny layouts like the composite's (texture table + sampler); leave Azimuth's
+        // game-pass root signatures untouched.
+        renodx::mods::shader::on_create_pipeline_layout = [](reshade::api::device*, std::span<reshade::api::pipeline_layout_param> params) {
+          return params.size() <= 3u;
+        };
+        renodx::utils::resource::upgrade::use_resource_cloning_dx12_only = true;
         initialized = true;
       }
+
+      // Module events first so their per-device data exists when this addon's init_device runs.
+      renodx::utils::resource::upgrade::Use(fdw_reason);
+      renodx::utils::swapchain::Use(fdw_reason);
+      renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
 
       renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
       SyncSwapChainOutputPreset();
@@ -529,16 +570,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
+      renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
+      renodx::utils::swapchain::Use(fdw_reason);
+      renodx::utils::resource::upgrade::Use(fdw_reason);
       next_color_space = std::nullopt;
       current_color_space = std::nullopt;
-      renodx::mods::swapchain::set_color_space = true;
       reshade::unregister_addon(h_module);
       break;
   }
-
-  renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
-  // No injection pointer: Azimuth's root signatures have no room for an injected parameter (see BindSettingsRootCbv).
-  renodx::mods::shader::Use(fdw_reason, custom_shaders);
 
   return TRUE;
 }
