@@ -387,7 +387,7 @@ void RestoreAfterStreamlineEvaluate(reshade::api::command_list* cmd_list, const 
 }
 // Before the tonemap draw (its bindings are set): DLSS inputs for frame generation and DLAA, then DLAA itself.
 void RecordDlssInputs(reshade::api::command_list* cmd_list) {
-  if (!forzahorizon2::streamline::IsActive()) return;
+  if (!forzahorizon2::streamline::inject::IsActive()) return;
 
   reshade::api::pipeline_layout layout = {0u};
   settings_root_cbvs.if_contains(cmd_list, [&](const auto& pair) { layout = pair.second.layout; });
@@ -513,7 +513,7 @@ void RecordDlssInputs(reshade::api::command_list* cmd_list) {
 // After the tonemap draw: the HUD-less scene for DLSS-G, by re-issuing that draw (replaced tonemap PSO and every
 // binding still set) into the owned RGBA16F target, then restoring Azimuth's render targets.
 void RecordHudlessScene(reshade::api::command_list* cmd_list) {
-  if (!forzahorizon2::streamline::IsActive()) return;
+  if (!forzahorizon2::streamline::inject::IsActive()) return;
   const auto target_view = renodx::utils::state::GetRenderTarget(cmd_list, 0u);
   if (target_view.handle == 0u) return;
   auto* device = cmd_list->get_device();
@@ -536,7 +536,7 @@ void RecordHudlessScene(reshade::api::command_list* cmd_list) {
 }
 
 void CaptureSceneColor(reshade::api::command_list* cmd_list) {
-  if (!forzahorizon2::streamline::IsActive()) return;
+  if (!forzahorizon2::streamline::inject::IsActive()) return;
   const auto view = renodx::utils::state::GetRenderTarget(cmd_list, 0u);
   if (view.handle == 0u) return;
   const auto scene_color = ResolveUpgradedResource(cmd_list->get_device()->get_resource_from_view(view));
@@ -545,7 +545,7 @@ void CaptureSceneColor(reshade::api::command_list* cmd_list) {
 }
 
 void CaptureDisplayPlane(reshade::api::command_list* cmd_list) {
-  if (!forzahorizon2::streamline::IsActive()) return;
+  if (!forzahorizon2::streamline::inject::IsActive()) return;
   const auto view = renodx::utils::state::GetRenderTarget(cmd_list, 0u);
   if (view.handle == 0u) return;
   const auto display_plane = ResolveUpgradedResource(cmd_list->get_device()->get_resource_from_view(view));
@@ -554,7 +554,7 @@ void CaptureDisplayPlane(reshade::api::command_list* cmd_list) {
 }
 
 void RecordFrameGenerationUiInputs(reshade::api::command_list* cmd_list) {
-  if (!forzahorizon2::streamline::IsActive()) return;
+  if (!forzahorizon2::streamline::inject::IsActive()) return;
   auto* device = cmd_list->get_device();
 
   const std::unique_lock lock(frame_generation_inputs.mutex);
@@ -622,7 +622,7 @@ void RecordFrameGenerationUiInputs(reshade::api::command_list* cmd_list) {
     LogFrameGenerationFailure("forzahorizon2: DLSS-G UI separation pass failed.");
     return;
   }
-  forzahorizon2::streamline::TagUiInputs(cmd_list, inputs.hudless, inputs.ui_alpha, inputs.width, inputs.height);
+  forzahorizon2::streamline::inject::TagUiInputs(cmd_list, inputs.hudless, inputs.ui_alpha, inputs.width, inputs.height);
 
 #ifdef FH2_DEV_SETTINGS
   // Tints the presented (real) frame in the backbuffer the output pass just wrote.
@@ -989,39 +989,39 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .key = "FrameGeneration",
-        .binding = &forzahorizon2::streamline::frame_generation_setting,
+        .binding = &forzahorizon2::streamline::inject::frame_generation_setting,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
         .label = "DLSS Frame Generation",
         .section = "Frame Generation",
         .tooltip = "Experimental. Requires NVIDIA's Streamline runtime in the renodx-streamline folder next to azimuth.exe.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_enabled = []() { return forzahorizon2::streamline::inject::IsActive(); },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
     new renodx::utils::settings::Setting{
         .key = "FrameGenerationMultiplier",
-        .binding = &forzahorizon2::streamline::frame_generation_multiplier_setting,
+        .binding = &forzahorizon2::streamline::inject::frame_generation_multiplier_setting,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
         .label = "Frame Generation Multiplier",
         .section = "Frame Generation",
         .tooltip = "Output frames per rendered frame. 3x/4x need DLSS multi frame generation support (RTX 50 series).",
         .labels = {"2x", "3x", "4x"},
-        .is_enabled = []() { return forzahorizon2::streamline::IsActive() && forzahorizon2::streamline::frame_generation_setting != 0.f; },
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_enabled = []() { return forzahorizon2::streamline::inject::IsActive() && forzahorizon2::streamline::inject::frame_generation_setting != 0.f; },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
     new renodx::utils::settings::Setting{
         .key = "Reflex",
-        .binding = &forzahorizon2::streamline::reflex_setting,
+        .binding = &forzahorizon2::streamline::inject::reflex_setting,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 1.f,
         .label = "NVIDIA Reflex",
         .section = "Frame Generation",
         .tooltip = "Reflex low latency. DLSS Frame Generation requires Reflex, so Off only applies while frame generation is off.",
         .labels = {"Off", "On", "On + Boost"},
-        .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_enabled = []() { return forzahorizon2::streamline::inject::IsActive(); },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
 #ifdef FH2_DEV_SETTINGS
     new renodx::utils::settings::Setting{
@@ -1035,8 +1035,8 @@ renodx::utils::settings::Settings settings = {
                    "\nSolid: any HUD pixel (including translucent panels and edges) comes from the real frame."
                    "\nExact: translucent HUD pixels blend over the interpolated scene.",
         .labels = {"Exact", "Solid"},
-        .is_enabled = []() { return forzahorizon2::streamline::IsActive() && forzahorizon2::streamline::frame_generation_setting != 0.f; },
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_enabled = []() { return forzahorizon2::streamline::inject::IsActive() && forzahorizon2::streamline::inject::frame_generation_setting != 0.f; },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
     new renodx::utils::settings::Setting{
         .key = "FrameGenerationUiDebug",
@@ -1049,7 +1049,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Tints the presented real frame red where DLSS-G treats pixels as UI."
                    "\nUI Alpha: the tagged mask. HUD Coverage: display plane alpha. HUD Difference: visible HUD change.",
         .labels = {"Off", "UI Alpha", "HUD Coverage", "HUD Difference"},
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
 #endif
     new renodx::utils::settings::Setting{
@@ -1062,8 +1062,8 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Experimental. NVIDIA DLAA (DLSS at native resolution) on the scene before post-processing."
                    "\nRequires antialiasing=off in azimuth.ini and sl.dlss.dll / nvngx_dlss.dll in renodx-streamline.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_enabled = []() { return forzahorizon2::streamline::inject::IsActive(); },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
 // Development knobs (pacing, jitter convention and jitter-only tests); shipping uses their defaults.
 #ifdef FH2_DEV_SETTINGS
@@ -1077,7 +1077,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Sign of the sub-pixel jitter reported to DLSS. Pick the option with the sharpest, most stable image.",
         .labels = {"Default", "Flip X", "Flip Y", "Flip Both"},
         .is_enabled = []() { return forzahorizon2::jitter::dlaa_setting != 0.f; },
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
     new renodx::utils::settings::Setting{
         .key = "DlaaJitterTest",
@@ -1089,19 +1089,19 @@ renodx::utils::settings::Settings settings = {
         .section = "DLAA",
         .tooltip = "Development test for DLAA: sub-pixel jitters scene rendering every frame (shimmers without DLAA).",
         .labels = {"Off", "On"},
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
     new renodx::utils::settings::Setting{
         .key = "ReflexFrameLimit",
-        .binding = &forzahorizon2::streamline::reflex_frame_limit_setting,
+        .binding = &forzahorizon2::streamline::inject::reflex_frame_limit_setting,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
         .label = "Reflex Frame Limit",
         .section = "Frame Generation",
         .tooltip = "Lets Reflex pace rendered frames at 60 fps (the game simulation is always 60).\nCompare frame-time evenness with Off, where only Azimuth paces.",
         .labels = {"Off", "60 fps"},
-        .is_enabled = []() { return forzahorizon2::streamline::IsActive(); },
-        .is_visible = []() { return forzahorizon2::streamline::initialized; },
+        .is_enabled = []() { return forzahorizon2::streamline::inject::IsActive(); },
+        .is_visible = []() { return forzahorizon2::streamline::inject::initialized; },
     },
 #endif
     new renodx::utils::settings::Setting{
@@ -1211,10 +1211,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::utils::resource::upgrade::use_resource_cloning_dx12_only = true;
         // DLSS input passes restore Azimuth's command list state from tracked snapshots; only pay for that
         // tracking when the Streamline runtime is installed.
-        std::array<wchar_t, MAX_PATH> executable_path = {};
-        GetModuleFileNameW(nullptr, executable_path.data(), static_cast<DWORD>(executable_path.size()));
-        renodx::utils::state::use_snapshot = std::filesystem::exists(
-            std::filesystem::path(executable_path.data()).parent_path() / forzahorizon2::streamline::PLUGIN_FOLDER_NAME / L"sl.interposer.dll");
+        forzahorizon2::streamline::inject::config = forzahorizon2::streamline::CONFIG;
+        renodx::utils::state::use_snapshot = std::filesystem::exists(forzahorizon2::streamline::inject::GetPluginFolder() / L"sl.interposer.dll");
         initialized = true;
       }
 
@@ -1234,11 +1232,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
       SyncSwapChainOutputPreset();
-      reshade::register_event<reshade::addon_event::create_device>(forzahorizon2::streamline::OnCreateDevice);
-      reshade::register_event<reshade::addon_event::init_device>(forzahorizon2::streamline::OnInitDevice);
-      reshade::register_event<reshade::addon_event::present>(forzahorizon2::streamline::OnPresent);
-      reshade::register_event<reshade::addon_event::finish_present>(forzahorizon2::streamline::OnFinishPresent);
-      reshade::register_event<reshade::addon_event::destroy_swapchain>(forzahorizon2::streamline::OnDestroySwapchain);
+      forzahorizon2::streamline::inject::Use(fdw_reason);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
@@ -1249,12 +1243,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OnDestroyPipelineLayout);
       break;
     case DLL_PROCESS_DETACH:
-      reshade::unregister_event<reshade::addon_event::create_device>(forzahorizon2::streamline::OnCreateDevice);
-      reshade::unregister_event<reshade::addon_event::init_device>(forzahorizon2::streamline::OnInitDevice);
-      reshade::unregister_event<reshade::addon_event::present>(forzahorizon2::streamline::OnPresent);
-      reshade::unregister_event<reshade::addon_event::finish_present>(forzahorizon2::streamline::OnFinishPresent);
-      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(forzahorizon2::streamline::OnDestroySwapchain);
-      forzahorizon2::streamline::Uninstall();
+      forzahorizon2::streamline::inject::Use(fdw_reason);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(forzahorizon2::jitter::OnBindRenderTargetsAndDepthStencil);
