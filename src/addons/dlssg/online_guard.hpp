@@ -78,7 +78,7 @@ inline void Poll(std::span<const uint16_t> online_udp_ports) {
   }
   std::ranges::sort(ports);
   // Gate evidence: the local UDP ports the game binds in single player (Online is captured without the mod).
-  if (ports != logged_ports && port_log_count < 64u) {
+  if ((ports != logged_ports || port_log_count == 0u) && port_log_count < 64u) {
     ++port_log_count;
     std::string port_list;
     for (const uint16_t port : ports) {
