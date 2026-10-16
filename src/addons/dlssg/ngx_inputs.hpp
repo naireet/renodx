@@ -6,6 +6,7 @@
 
 #include <Windows.h>
 
+#include <d3d11.h>
 #include <d3d12.h>
 
 #include <array>
@@ -18,6 +19,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include <nvsdk_ngx.h>
@@ -101,7 +103,8 @@ inline void OnCreateFeature(NVSDK_NGX_Feature feature_id, const NVSDK_NGX_Parame
       ", AutoExposure ", (info.create_flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) != 0, ")");
 }
 
-inline void OnEvaluateFeature(ID3D12GraphicsCommandList* /*cmd_list*/, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters) {
+template <typename CommandList, typename Resource>
+inline void OnEvaluateFeature(CommandList* /*command_list*/, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters) {
   const uint64_t evaluate_index = evaluate_count.fetch_add(1u) + 1u;
   evaluated_since_present = true;
   if (parameters == nullptr) return;
@@ -142,14 +145,25 @@ inline void OnEvaluateFeature(ID3D12GraphicsCommandList* /*cmd_list*/, const NVS
   if ((evaluate_index > 3u && !extents_changed && summary.reset == 0) || evaluate_log_count.fetch_add(1u) >= 40u) return;
 
   const auto describe_resource = [parameters](const char* name) -> std::string {
-    ID3D12Resource* resource = nullptr;
+    Resource* resource = nullptr;
     if (NVSDK_NGX_FAILED(parameters->Get(name, &resource)) || resource == nullptr) {
       void* untyped = nullptr;
       if (NVSDK_NGX_FAILED(parameters->Get(name, &untyped)) || untyped == nullptr) return "none";
-      resource = static_cast<ID3D12Resource*>(untyped);
+      resource = static_cast<Resource*>(untyped);
     }
-    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    return renodx::utils::log::BuildString(desc.Width, "x", desc.Height, " fmt ", static_cast<uint32_t>(desc.Format));
+    if constexpr (std::is_same_v<Resource, ID3D12Resource>) {
+      const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+      return renodx::utils::log::BuildString(desc.Width, "x", desc.Height, " fmt ", static_cast<uint32_t>(desc.Format));
+    } else {
+      ID3D11Texture2D* texture = nullptr;
+      if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&texture)))) return "not a 2D texture";
+      D3D11_TEXTURE2D_DESC desc = {};
+      texture->GetDesc(&desc);
+      texture->Release();
+      return renodx::utils::log::BuildString(
+          desc.Width, "x", desc.Height, " fmt ", static_cast<uint32_t>(desc.Format), " bind ",
+          renodx::utils::log::AsHex(desc.BindFlags), " misc ", renodx::utils::log::AsHex(desc.MiscFlags));
+    }
   };
   renodx::utils::log::i(
       "dlssg: NGX DLSS SR evaluate #", evaluate_index, " on thread ", GetCurrentThreadId(),
@@ -190,7 +204,9 @@ inline void HookSnippet(HMODULE module) {
         "dlssg: hooked ", file_name, " (", std::filesystem::path(path.data()).parent_path().string(), "): ",
         result.installed, " installed, ", result.missing, " missing, ", result.failed, " failed; D3D12 CreateFeature ",
         nvngx::real_NVSDK_NGX_D3D12_CreateFeature != nullptr, ", EvaluateFeature ", nvngx::real_NVSDK_NGX_D3D12_EvaluateFeature != nullptr,
-        ", EvaluateFeature_C ", nvngx::real_NVSDK_NGX_D3D12_EvaluateFeature_C != nullptr);
+        ", EvaluateFeature_C ", nvngx::real_NVSDK_NGX_D3D12_EvaluateFeature_C != nullptr,
+        "; D3D11 CreateFeature ", nvngx::real_NVSDK_NGX_D3D11_CreateFeature != nullptr,
+        ", EvaluateFeature ", nvngx::real_NVSDK_NGX_D3D11_EvaluateFeature != nullptr);
     if (result.Active() != 0u) {
       hooked_snippet = module;
     }
@@ -238,7 +254,9 @@ inline BOOL WINAPI OnFreeLibrary(HMODULE module) {
 // Process lifetime: the add-on is pinned, so these hooks are never removed.
 inline void Install() {
   renodx::utils::dlss::nvngx::on_d3d12_create_feature = &OnCreateFeature;
-  renodx::utils::dlss::nvngx::on_d3d12_evaluate_feature = &OnEvaluateFeature;
+  renodx::utils::dlss::nvngx::on_d3d12_evaluate_feature = &OnEvaluateFeature<ID3D12GraphicsCommandList, ID3D12Resource>;
+  renodx::utils::dlss::nvngx::on_d3d11_create_feature = &OnCreateFeature;
+  renodx::utils::dlss::nvngx::on_d3d11_evaluate_feature = &OnEvaluateFeature<ID3D11DeviceContext, ID3D11Resource>;
   HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
   original_load_library_ex_w = reinterpret_cast<LoadLibraryExWFunction>(GetProcAddress(kernelbase, "LoadLibraryExW"));
   original_free_library = reinterpret_cast<FreeLibraryFunction>(GetProcAddress(kernelbase, "FreeLibrary"));

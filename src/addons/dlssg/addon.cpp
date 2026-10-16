@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -18,6 +19,7 @@
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
+#include "../../utils/dlss/d3d11_bridge.hpp"
 #include "../../utils/dlss/streamline_inject.hpp"
 #include "../../utils/log.hpp"
 #include "../../utils/settings.hpp"
@@ -30,9 +32,11 @@
 namespace {
 
 namespace inject = renodx::utils::streamline::inject;
+namespace d3d11_bridge = renodx::utils::dlss::d3d11_bridge;
 
 // G0: Streamline bootstrap (DLSS-G off) plus observation of the game's DLSS inputs, NVAPI Reflex and online state.
 // G1 tags the game's DLSS inputs and translates its Reflex into Streamline, then opens this gate.
+// D3D11 games first run G0a: the D3D11 -> D3D12 present bridge alone, without Streamline.
 constexpr bool FRAME_GENERATION_GATE_OPEN = false;
 
 struct GameProfile {
@@ -41,6 +45,9 @@ struct GameProfile {
   inject::Config streamline;
   std::span<const std::wstring_view> online_command_line_tokens;
   std::span<const uint16_t> online_udp_ports;
+  // D3D11 game: present through the private D3D12 swapchain (Streamline DLSS-G is D3D12/Vulkan only).
+  bool d3d11_bridge = false;
+  std::wstring_view d3d11_bridge_window_class;
 };
 
 // Red Dead Online runs from RDR2.exe. Rockstar's launcher switch straight into Online, and Rockstar's peer-to-peer
@@ -48,7 +55,7 @@ struct GameProfile {
 constexpr std::array<std::wstring_view, 1> RDR2_ONLINE_COMMAND_LINE_TOKENS = {L"-StraightIntoFreemode"};
 constexpr std::array<uint16_t, 1> RDR2_ONLINE_UDP_PORTS = {6672u};
 
-constexpr std::array<GameProfile, 1> PROFILES = {{
+constexpr std::array<GameProfile, 2> PROFILES = {{
     {
         .executable = L"rdr2.exe",
         .name = "Red Dead Redemption 2",
@@ -63,6 +70,21 @@ constexpr std::array<GameProfile, 1> PROFILES = {{
         .online_command_line_tokens = RDR2_ONLINE_COMMAND_LINE_TOKENS,
         .online_udp_ports = RDR2_ONLINE_UDP_PORTS,
     },
+    // D3D11, DLSS SR through NGX, no native Reflex; optional co-op without anti-cheat, so no online guard.
+    {
+        .executable = L"nioh2.exe",
+        .name = "Nioh 2",
+        .streamline = {
+            .plugin_folder_name = L"renodx-streamline",
+            .project_id = "3f9b6d2e-7a41-4c85-b0e3-9d16a5c7f248",
+            .engine_version = "Koei Tecmo (Nioh 2)",
+            .load_dlss = false,
+            .hook_create_swap_chain = false,
+            .synthesize_reflex = true,
+        },
+        .d3d11_bridge = true,
+        .d3d11_bridge_window_class = L"NIOH",
+    },
 }};
 
 const GameProfile* active_profile = nullptr;
@@ -74,8 +96,29 @@ renodx::utils::settings::Settings settings = {
         .section = "Status",
         .on_draw = [] {
           ImGui::Text("Game: %s", active_profile->name);
-          ImGui::Text("Gate: %s", (FRAME_GENERATION_GATE_OPEN ? "G1+ (frame generation available)" : "G0 (Streamline bootstrap, frame generation off)"));
-          if (!inject::initialized) {
+          if (active_profile->d3d11_bridge) {
+            ImGui::Text("Gate: G0a (D3D11 -> D3D12 bridge only: no Streamline, frame generation off)");
+            const std::shared_lock lock(d3d11_bridge::status.mutex);
+            const auto& bridge = d3d11_bridge::status;
+            if (bridge.active) {
+              ImGui::Text("D3D11 bridge: active, %ux%u, format %d, colour space %d", bridge.width, bridge.height,
+                          static_cast<int>(bridge.format), static_cast<int>(bridge.color_space));
+              ImGui::Text("Copy %.3f ms GPU, bridge %.3f ms CPU, D3D12 Present %.3f ms CPU (%llu frames)",
+                          bridge.copy_gpu_ms, bridge.bridge_cpu_ms, bridge.present_cpu_ms, static_cast<unsigned long long>(bridge.frames));
+            } else if (bridge.installed) {
+              ImGui::Text("D3D11 bridge: installed, game swapchain not bridged");
+            } else {
+              ImGui::Text("D3D11 bridge: not installed");
+            }
+            if (!bridge.last_error.empty()) {
+              ImGui::TextWrapped("Bridge error: %s", bridge.last_error.c_str());
+            }
+          } else {
+            ImGui::Text("Gate: %s", (FRAME_GENERATION_GATE_OPEN ? "G1+ (frame generation available)" : "G0 (Streamline bootstrap, frame generation off)"));
+          }
+          if (active_profile->d3d11_bridge) {
+            ImGui::Text("Streamline: not used at G0a");
+          } else if (!inject::initialized) {
             ImGui::TextWrapped("Streamline: not loaded (place NVIDIA's signed runtime in renodx-streamline next to the game executable).");
           } else {
             ImGui::Text("Streamline: %s, swapchain %ux%u", (inject::IsActive() ? "active" : "loaded, no proxied swapchain yet"),
@@ -89,12 +132,18 @@ renodx::utils::settings::Settings settings = {
                       (evaluated_last_frame ? "evaluating" : "idle"),
                       static_cast<unsigned long long>(dlssg::ngx::evaluate_count.load()),
                       summary.render_width, summary.render_height, summary.output_width, summary.output_height);
-          constexpr std::array<const char*, 4> REFLEX_MODES = {"not set", "Off", "On", "On + Boost"};
-          ImGui::Text("Game Reflex: %s, %llu sleeps, %llu markers",
-                      REFLEX_MODES.at(std::min(dlssg::reflex::game_reflex_mode.load(), 3u)),
-                      static_cast<unsigned long long>(dlssg::reflex::game_sleep_calls.load()),
-                      static_cast<unsigned long long>(dlssg::reflex::game_marker_calls.load()));
-          if (dlssg::online_guard::online_detected) {
+          if (active_profile->d3d11_bridge) {
+            ImGui::Text("Game Reflex: none (synthesized markers from G0b)");
+          } else {
+            constexpr std::array<const char*, 4> REFLEX_MODES = {"not set", "Off", "On", "On + Boost"};
+            ImGui::Text("Game Reflex: %s, %llu sleeps, %llu markers",
+                        REFLEX_MODES.at(std::min(dlssg::reflex::game_reflex_mode.load(), 3u)),
+                        static_cast<unsigned long long>(dlssg::reflex::game_sleep_calls.load()),
+                        static_cast<unsigned long long>(dlssg::reflex::game_marker_calls.load()));
+          }
+          if (active_profile->online_udp_ports.empty()) {
+            ImGui::Text("Online guard: not needed for this game");
+          } else if (dlssg::online_guard::online_detected) {
             ImGui::TextColored(ImVec4(1.f, 0.3f, 0.3f, 1.f), "Online session detected: frame generation disabled. Quit and remove the mod before playing online.");
           } else {
             ImGui::Text("Online guard: single player");
@@ -128,7 +177,15 @@ renodx::utils::settings::Settings settings = {
     },
 };
 
+// D3D11 profiles install the bridge here: DXGI is loaded, the loader lock is not held, and the game has not created its
+// swapchain yet.
 void OnInitDevice(reshade::api::device* device) {
+  if (active_profile->d3d11_bridge) {
+    if (device->get_api() == reshade::api::device_api::d3d11) {
+      d3d11_bridge::Install();
+    }
+    return;
+  }
   if (device->get_api() != reshade::api::device_api::d3d12) return;
   dlssg::reflex::Install();
 }
@@ -176,7 +233,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
         active_profile = nullptr;
         break;
       }
-      renodx::utils::log::i("dlssg: ", active_profile->name, " profile, gate ", (FRAME_GENERATION_GATE_OPEN ? "open" : "G0 (frame generation off)"), ".");
+      renodx::utils::log::i(
+          "dlssg: ", active_profile->name, " profile, gate ",
+          (active_profile->d3d11_bridge ? "G0a (D3D11 bridge only)" : (FRAME_GENERATION_GATE_OPEN ? "open" : "G0 (frame generation off)")), ".");
 
       // Hooks into this module (Streamline vtable slots, NVAPI, NGX, loader) live for the process, like Streamline.
       {
@@ -195,7 +254,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       renodx::utils::settings::global_name = "RENODX-DLSSG";
 
       reshade::register_event<reshade::addon_event::present>(OnPresent);
-      inject::Use(fdw_reason);
+      if (active_profile->d3d11_bridge) {
+        d3d11_bridge::required_window_class = active_profile->d3d11_bridge_window_class;
+      } else {
+        inject::Use(fdw_reason);
+      }
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       dlssg::ngx::Install();
       renodx::utils::settings::Use(fdw_reason, &settings);
