@@ -18,6 +18,19 @@
 
 namespace renodx::utils::dlss::nvngx {
 
+// Optional observers for add-ons that consume the game's DLSS inputs, called with the native command list.
+// Create: after the real call (the handle identifies later evaluates). Evaluate: before the real call, while the
+// inputs are in DLSS's required states; observers may record work but the game expects NGX to clobber
+// command list state, so nothing has to be restored for the game.
+using D3D12CreateFeatureObserver = void (*)(NVSDK_NGX_Feature feature_id, const NVSDK_NGX_Parameter* parameters, const NVSDK_NGX_Handle* handle);
+using D3D12EvaluateFeatureObserver = void (*)(ID3D12GraphicsCommandList* cmd_list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters);
+static D3D12CreateFeatureObserver on_d3d12_create_feature = nullptr;
+static D3D12EvaluateFeatureObserver on_d3d12_evaluate_feature = nullptr;
+// D3D11: create as above; evaluate after the real call (with the native immediate/deferred context), once DLSS has
+// read its inputs. D3D11 copies need no state restore.
+using D3D11EvaluateFeatureObserver = void (*)(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* parameters);
+static D3D12CreateFeatureObserver on_d3d11_create_feature = nullptr;
+static D3D11EvaluateFeatureObserver on_d3d11_evaluate_feature = nullptr;
 static decltype(&NVSDK_NGX_D3D11_Init) real_NVSDK_NGX_D3D11_Init = nullptr;
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D11_Init(unsigned long long InApplicationId, const wchar_t* InApplicationDataPath, ID3D11Device* InDevice, const NVSDK_NGX_FeatureCommonInfo* InFeatureInfo = nullptr, NVSDK_NGX_Version InSDKVersion = NVSDK_NGX_Version_API) {
 #ifdef DEBUG_LEVEL_0
@@ -78,7 +91,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D11_CreateFeature(I
   utils::log::d("utils::dlss::nvngx::hooked_NVSDK_NGX_D3D11_CreateFeature()");
 #endif
   utils::directx::NativeFromReShadeProxy(&InDevCtx);
-  return real_NVSDK_NGX_D3D11_CreateFeature(InDevCtx, InFeatureID, InParameters, OutHandle);
+  const NVSDK_NGX_Result result = real_NVSDK_NGX_D3D11_CreateFeature(InDevCtx, InFeatureID, InParameters, OutHandle);
+  if (on_d3d11_create_feature != nullptr && NVSDK_NGX_SUCCEED(result) && OutHandle != nullptr) {
+    on_d3d11_create_feature(InFeatureID, InParameters, *OutHandle);
+  }
+  return result;
 }
 
 static decltype(&NVSDK_NGX_D3D12_CreateFeature) real_NVSDK_NGX_D3D12_CreateFeature = nullptr;
@@ -98,7 +115,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D12_CreateFeature(I
         utils::log::AsPtr(InCmdList));
   }
 #endif
-  return real_NVSDK_NGX_D3D12_CreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
+  const NVSDK_NGX_Result result = real_NVSDK_NGX_D3D12_CreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
+  if (on_d3d12_create_feature != nullptr && NVSDK_NGX_SUCCEED(result) && OutHandle != nullptr) {
+    on_d3d12_create_feature(InFeatureID, InParameters, *OutHandle);
+  }
+  return result;
 }
 
 static decltype(&NVSDK_NGX_D3D11_EvaluateFeature) real_NVSDK_NGX_D3D11_EvaluateFeature = nullptr;
@@ -107,7 +128,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D11_EvaluateFeature
   utils::log::d("utils::dlss::nvngx::hooked_NVSDK_NGX_D3D11_EvaluateFeature()");
 #endif
   utils::directx::NativeFromReShadeProxy(&InDevCtx);
-  return real_NVSDK_NGX_D3D11_EvaluateFeature(InDevCtx, InFeatureHandle, InParameters, InCallback);
+  const NVSDK_NGX_Result result = real_NVSDK_NGX_D3D11_EvaluateFeature(InDevCtx, InFeatureHandle, InParameters, InCallback);
+  if (on_d3d11_evaluate_feature != nullptr) {
+    on_d3d11_evaluate_feature(InDevCtx, InFeatureHandle, InParameters);
+  }
+  return result;
 }
 
 static decltype(&NVSDK_NGX_D3D12_EvaluateFeature) real_NVSDK_NGX_D3D12_EvaluateFeature = nullptr;
@@ -127,13 +152,20 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D12_EvaluateFeature
         utils::log::AsPtr(InCmdList));
   }
 #endif
+  if (on_d3d12_evaluate_feature != nullptr) {
+    on_d3d12_evaluate_feature(InCmdList, InFeatureHandle, InParameters);
+  }
   return real_NVSDK_NGX_D3D12_EvaluateFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
 }
 
 static decltype(&NVSDK_NGX_D3D11_EvaluateFeature_C) real_NVSDK_NGX_D3D11_EvaluateFeature_C = nullptr;
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D11_EvaluateFeature_C(ID3D11DeviceContext* InDevCtx, const NVSDK_NGX_Handle* InFeatureHandle, const NVSDK_NGX_Parameter* InParameters, PFN_NVSDK_NGX_ProgressCallback_C InCallback) {
   utils::directx::NativeFromReShadeProxy(&InDevCtx);
-  return real_NVSDK_NGX_D3D11_EvaluateFeature_C(InDevCtx, InFeatureHandle, InParameters, InCallback);
+  const NVSDK_NGX_Result result = real_NVSDK_NGX_D3D11_EvaluateFeature_C(InDevCtx, InFeatureHandle, InParameters, InCallback);
+  if (on_d3d11_evaluate_feature != nullptr) {
+    on_d3d11_evaluate_feature(InDevCtx, InFeatureHandle, InParameters);
+  }
+  return result;
 }
 
 static decltype(&NVSDK_NGX_D3D12_EvaluateFeature_C) real_NVSDK_NGX_D3D12_EvaluateFeature_C = nullptr;
@@ -153,6 +185,9 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D12_EvaluateFeature
         utils::log::AsPtr(InCmdList));
   }
 #endif
+  if (on_d3d12_evaluate_feature != nullptr) {
+    on_d3d12_evaluate_feature(InCmdList, InFeatureHandle, InParameters);
+  }
   return real_NVSDK_NGX_D3D12_EvaluateFeature_C(InCmdList, InFeatureHandle, InParameters, InCallback);
 }
 
