@@ -130,9 +130,11 @@ Read-only look at `D:\SteamLibrary\steamapps\common\Nioh2` and its `ReShade.log`
   `renodx-dlssg` would fail to load here exactly like `renodx-dlss5.addon64` does now: its log line is *"requested API
   version (18) is not supported (17)"*, i.e. error 1114 is an API mismatch, not a corrupt file. Testing needs ReShade
   6.8.0 in that folder (API 17 add-ons such as `renodx-nioh2` keep loading on it).
-- `renodx-dlss5.addon64` is from the unverified "DLSS 5" add-on family. Upgrading ReShade would make it load and hook
-  NGX evaluate next to ours, so it must be **disabled (renamed to `renodx-dlss5.addon64.off`) before any test**; it is
-  left in place, untouched, until the user approves the test.
+- `renodx-dlss5.addon64` is the unverified "DLSS 5 Neural Rendering" lookalike (v0.2026.0828.0517, 1,732,608 bytes,
+  SHA-256 `D5ADF82EB44B065F4C590AC91FE824BAB07AFEA0EB9F994BDE936710C8593952`, **not signed**, no download-origin
+  mark, built in a foreign `C:\RenoDX Build Environment\` tree; its own text says "for DX12 games", so it does nothing
+  in this D3D11 game). Upgrading ReShade would make it load and hook NGX next to ours, so it is **removed** from the
+  game folder before any test (not just renamed). It stays untouched until the user approves.
 - Zero-byte `d3d11.dll`, `d3dcompiler_46.dll` and `d3dx.ini` (3DMigoto leftovers). ReShade logs `system32\d3d11.dll`
   being used, so they are inert today; left alone, noted as a risk if load order ever changes.
 
@@ -262,7 +264,7 @@ without DLSS) veto frame generation.
 
 ### What the user tests (only after approving the deploy)
 
-1. Rename `renodx-dlss5.addon64` → `renodx-dlss5.addon64.off`; back up `dxgi.dll` and replace it with ReShade 6.8.0
+1. Remove `renodx-dlss5.addon64` from the game folder (unverified package, see above); back up `dxgi.dll` and replace it with ReShade 6.8.0
    (add-on build, same as FH2). Confirm the game and `renodx-nioh2` HDR still look as before (no DLSS-G add-on yet).
 2. G0a: add `renodx-dlssg.G0a.addon64`; play a few minutes in a mission (DLSS on) and in menus; alt-tab, change
    resolution, toggle HDR; check the ReShade overlay (Home). Send `ReShade.log` and the add-on log.
@@ -270,5 +272,4 @@ without DLSS) veto frame generation.
 4. G0b: same steps with `renodx-streamline\` (NVIDIA-signed DLLs) added; send logs.
 5. G1 and later: as on FH2 (parked camera, then motion), phone video for artifacts, PresentMon capture.
 
-Undo at any point: remove the add-on and `renodx-streamline\`, restore the backed-up `dxgi.dll`, rename
-`renodx-dlss5.addon64.off` back if wanted.
+Undo at any point: remove the add-on and `renodx-streamline\`, restore the backed-up `dxgi.dll`.
