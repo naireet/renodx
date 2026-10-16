@@ -169,12 +169,12 @@ Read-only look at `D:\SteamLibrary\steamapps\common\Nioh2` and its `ReShade.log`
 game (D3D11)                                        renodx-dlssg (owned)
  NGX D3D11 Evaluate ──hook──► after real evaluate: CopyResource depth/MV → owned shared ring[slot] (same context)
  ReShade wrapper ─► Present ─► proxy IDXGISwapChain4 (below ReShade) ─► Signal(shared fence) on game immediate ctx
-                                  │  back buffers = owned D3D11 SHARED_NTHANDLE textures (game + ReShade + RenoDX
-                                  │  render into them)
+                                  │  back buffer = one owned D3D11 SHARED_NTHANDLE texture (game + ReShade + RenoDX
+                                  │  render into it)
                                   ▼
                      private D3D12 device (same LUID) ─ queue.Wait(fence) ─ copy back buffer → SL swapchain buffer
                      ─ tag depth/MV/extent (frame-based, ring slot) ─ PCL markers ─ SL proxy swapchain Present
-                     ─ Signal(fence) ─ game ctx Wait before that back buffer / ring slot is reused
+                     ─ Signal(fence) ─ game ctx Wait before the back buffer / ring slot is reused
 ```
 
 **1. Inputs.** Add `on_d3d11_create_feature` / `on_d3d11_evaluate_feature` observers to `utils/dlss/nvngx.hpp`
@@ -197,8 +197,9 @@ Chosen over the alternatives:
   (~15 MB each) ≈ 0.1–0.2 ms of copies, plus one cross-API fence per frame. G0 measures it with D3D11/D3D12
   timestamp queries and logs the averages; PresentMon compares latency against vanilla.
 
-**3. Swapchain.** The game gets a proxy `IDXGISwapChain4` whose `GetBuffer` returns owned D3D11 textures in the
-upgraded format (shared, render target + shader resource), with `GetCurrentBackBufferIndex` rotating through them.
+**3. Swapchain.** The game gets a proxy `IDXGISwapChain4` whose `GetBuffer` returns one owned D3D11 texture in the
+upgraded format (shared, render target + shader resource) and whose `GetCurrentBackBufferIndex` is always 0: D3D11
+flip-model apps (and ReShade) only ever use buffer 0, so a rotating set would buy nothing but extra copies.
 The real swapchain is D3D12 flip-discard on the **game's HWND**, created through Streamline's proxy factory on the
 private queue, same size/format/flags (`ALLOW_TEARING` if RenoDX set it) and buffer count. Forwarded to it:
 `ResizeBuffers[1]` (drain the queue, recreate the shared ring), `SetColorSpace1`, `SetHDRMetaData`,
@@ -212,7 +213,8 @@ upgrade, resource upgrades and final swapchain pass all happen on the D3D11 side
 frame. Mechanism: ReShade hooks `IDXGIFactory*::CreateSwapChain*` by **vtable replacement** and calls the previous
 entry (the real `dxgi.dll` implementation) as its original. Its factory hooks are installed on the game's first
 `CreateDXGIFactory*`, before add-ons load, so the add-on reads the pristine vtable slot from `dxgi.dll`'s on-disk image
-(same RVA, relocated) and detours that implementation. Order: game → ReShade (RenoDX edits the description) →
+(same RVA, relocated) and detours that implementation. The G0a smoke test confirmed this order whether the factory is
+created before or after the device: game → ReShade (RenoDX edits the description) →
 bridge (sees the upgraded description, builds the proxy) → ReShade wraps the proxy. The detour only acts for the game's D3D11 device on its window; every other call (including Streamline creating the D3D12 swapchain) passes straight through. If the detour cannot be
 placed, the add-on stays off for D3D11 (it does not fall back to an untested path). OptiScaler's arrangement (above
 ReShade, real D3D11 swapchain on a hidden window) was rejected: ReShade's overlay input, RenoDX's window-size checks
@@ -236,6 +238,36 @@ D3D12 objects; FH2 keeps its current path unchanged. The bridge lives in a new s
 **HUD/menus:** as on D3D12. G1 tags no UI (HUD interpolated with the scene). G2 maps Nioh 2's first UI draw with the
 DevKit and tags an owned HUD-less copy. Frames without a DLSS evaluate (menus, loading, cutscenes if rendered
 without DLSS) veto frame generation.
+
+### G0a build (bridge only)
+
+Implemented in `src/utils/dlss/d3d11_bridge.hpp` and wired through the `nioh2.exe` profile in `addon.cpp`
+(`d3d11_bridge = true`, window class `NIOH`). Bridge profiles skip Streamline and Reflex entirely at G0a; the D3D11
+NGX observers only log the game's DLSS SR inputs. The status panel shows the bridge state, back-buffer size, format and
+colour space, and the averaged copy/present costs.
+
+- Install: `Install()` runs on the first D3D11 `init_device` (dxgi.dll loaded, loader lock not held). It checks that
+  slots 0..14 of `dxgi.dll`'s on-disk factory vtable match the loaded image and that slot 15 points into executable
+  code, then detours that implementation. Any check failure leaves the game on its normal swapchain and logs why.
+- Bridging only happens for a D3D11 device, flip-model `RENDER_TARGET_OUTPUT` swapchain on a top-level window of
+  this process with the profile's class, and only one swapchain at a time. Every failure falls back to the game's
+  normal D3D11 swapchain. Not bridged: the legacy `CreateSwapChain` and `D3D11CreateDeviceAndSwapChain` paths.
+- Per frame: D3D11 `Signal` + `Flush` → D3D12 queue `Wait` → `CopyResource` (timestamped) → D3D12 `Present` →
+  D3D11 `Wait` on the copy. `ResizeBuffers` drains the queue and recreates the shared buffer.
+
+Smoke test (stand-in D3D11 app with Nioh 2's device/swapchain sequence, ReShade 6.8.0 + `renodx-nioh2` + G0a, RTX 5080):
+the bridged output was pixel-identical to the unbridged run in every phase (screen sampled through desktop
+duplication), RenoDX's `R10G10B10A2` + `ALLOW_TEARING` upgrade and HDR10 colour space (`SetColorSpace1(12)`) were
+carried into the D3D12 swapchain, resize recreated everything, and `ReShade.log` showed one effect runtime. The copy
+itself costs ~0.005 ms of GPU at 1280x720. The cost to watch is the cross-API serialisation: the D3D11 queue waits
+for the D3D12 copy before reusing the single back buffer. In an empty uncapped scene that limited throughput to ~720 fps
+against ~1,700 fps unbridged (~0.8 ms per frame). That is the G0a measurement item: compare against vanilla with
+PresentMon in the game at its real frame rate.
+
+Toolkit: `C:\Tools\GameMods\Nioh 2\renodx` (pinned `renodx-dlssg.G0a[-debuglayer].addon64`, deploy/undo scripts).
+The debug-layer variant enables the D3D12 debug layer before the bridge creates its device and registers an info-queue
+callback on it through `d3d11_bridge::on_d3d12_device_created`. The D3D11 debug layer can be forced from `dxcpl` if
+needed.
 
 ### Risks
 
@@ -264,8 +296,9 @@ without DLSS) veto frame generation.
 
 ### What the user tests (only after approving the deploy)
 
-1. Remove `renodx-dlss5.addon64` from the game folder (unverified package, see above); back up `dxgi.dll` and replace it with ReShade 6.8.0
-   (add-on build, same as FH2). Confirm the game and `renodx-nioh2` HDR still look as before (no DLSS-G add-on yet).
+1. `renodx-dlss5.addon64` is already removed from the game folder (unverified package, see above). Back up `dxgi.dll` and
+   replace it with ReShade 6.8.0 (add-on build, same as FH2). Confirm the game and `renodx-nioh2` HDR still look as before
+   (no DLSS-G add-on yet).
 2. G0a: add `renodx-dlssg.G0a.addon64`; play a few minutes in a mission (DLSS on) and in menus; alt-tab, change
    resolution, toggle HDR; check the ReShade overlay (Home). Send `ReShade.log` and the add-on log.
 3. G0a-debuglayer variant: same, short run; send the debug output.
